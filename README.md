@@ -86,13 +86,13 @@ pre-commit install
 
 On commit, if a file is missing the header it will be modified; re-stage and commit again.
 
-### System Dependencies
+Note: this repository includes a trimmed coverage config for test runs at `tests/.coveragerc` which is used when running tests locally. CI writes test artifacts (junit/coverage/html) into timestamped folders under `tests/auto-test-reports/test-reports_<ISO>`; those folders are intentionally git-ignored so artifacts aren't committed. Use the helper `tests/auto-test-reports/parse_junit_and_coverage.py` to inspect saved/ downloaded test-reports.
 
+### System Dependencies
 Some components rely on system packages not available on PyPI:
 
 - Recoll (desktop full-text indexer) provides the keyword search backend.
 
-Install Recoll:
 
 Debian / Ubuntu:
 ```bash
