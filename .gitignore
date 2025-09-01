@@ -5,17 +5,19 @@ data/*autostart*.out
 data/capture.autostart.out
 data/electron.autostart.out
 data/status.json
-data/prefs.json            # keep a prefs.example.json under version control instead
+data/prefs.json
 data/*.pid
-data/capture.lock
+data/*.lock
 
 # Encrypted / extracted artifacts (large, personal)
 data/encrypted/**
 data/text/**
 data/ocr/**
+data/plain/**
 !data/encrypted/.gitkeep
 !data/text/.gitkeep
 !data/ocr/.gitkeep
+!data/plain/.gitkeep
 
 # Duplicate/diagnostic dumps if any
 data/*.tmp

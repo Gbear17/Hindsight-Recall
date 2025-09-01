@@ -15,6 +15,8 @@ from typing import Optional, Dict, Any
 import json
 from datetime import datetime, timezone
 import hashlib
+import subprocess
+import shlex
 
 from .screenshot import generate_filename
 from .ocr import extract_text, ocr_text_filename
@@ -95,7 +97,32 @@ class CaptureService:
         while not self._stop.is_set():
             start = time.time()
             try:
-                self._capture_once()
+                if self._is_screen_locked():
+                    # Emit lightweight paused status at most once per interval change
+                    self._sequence += 1
+                    pause_status = {
+                        "last_capture_utc": datetime.now(timezone.utc).isoformat(),
+                        "window_title": None,
+                        "window_bbox": None,
+                        "encrypted_image": None,
+                        "encrypted_text": None,
+                        "capture_count": self._capture_count,
+                        "interval_sec": self.interval,
+                        "error": None,
+                        "display_env": os.environ.get('DISPLAY'),
+                        "session_type": os.environ.get('XDG_SESSION_TYPE'),
+                        "process_pid": os.getpid(),
+                        "capture_backend": get_backend(),
+                        "service_instance_id": self._instance_id,
+                        "service_start_utc": self._started_utc,
+                        "sequence": self._sequence,
+                        "paused": True,
+                        "pause_reason": "screen_locked",
+                    }
+                    self._last_status = pause_status
+                    self._write_status(pause_status)
+                else:
+                    self._capture_once()
             except Exception as exc:  # pragma: no cover - safety net
                 LOGGER.exception("Capture cycle failed: %s", exc)
                 # Backend auto-adaptation: if repeated UnidentifiedImageError under ImageGrab, force mss next cycle.
@@ -274,6 +301,68 @@ class CaptureService:
             enc_txt.name,
             info.title,
         )
+
+    # --- Lock Detection Helpers (Linux focus) ---
+    def _is_screen_locked(self) -> bool:
+        """Best-effort detection of locked screen (Linux KDE/GNOME)."""
+        if os.name != 'posix':
+            return False
+        # Fast env hint (custom integration point)
+        if os.environ.get('HINDSIGHT_SCREEN_LOCKED') == '1':
+            return True
+        # loginctl LockedHint
+        sid = os.environ.get('XDG_SESSION_ID')
+        if sid:
+            locked = self._loginctl_locked(sid)
+            if locked is not None:
+                return locked
+        # GNOME dbus
+        val = self._dbus_screensaver_gnome()
+        if val is not None:
+            return val
+        # KDE / freedesktop
+        val = self._dbus_screensaver_generic()
+        if val is not None:
+            return val
+        return False
+
+    def _loginctl_locked(self, session_id: str):
+        try:
+            out = subprocess.check_output(['loginctl','show-session', session_id, '-p','LockedHint'], timeout=1).decode()
+            m = [l for l in out.split('\n') if l.startswith('LockedHint=')]
+            if m:
+                return m[0].strip().split('=',1)[1].lower() == 'yes'
+        except Exception:
+            return None
+        return None
+
+    def _dbus_screensaver_gnome(self):
+        cmd = 'gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive'
+        try:
+            out = subprocess.check_output(shlex.split(cmd), timeout=1, stderr=subprocess.DEVNULL).decode()
+            if 'true' in out.lower():
+                return True
+            if 'false' in out.lower():
+                return False
+        except Exception:
+            return None
+        return None
+
+    def _dbus_screensaver_generic(self):
+        # Try qdbus then dbus-send
+        try:
+            out = subprocess.check_output(['qdbus','org.freedesktop.ScreenSaver','/ScreenSaver','GetActive'], timeout=1, stderr=subprocess.DEVNULL).decode().strip().lower()
+            if out.startswith('true'): return True
+            if out.startswith('false'): return False
+        except Exception:
+            pass
+        try:
+            out = subprocess.check_output(['dbus-send','--session','--print-reply','--dest=org.freedesktop.ScreenSaver','/ScreenSaver','org.freedesktop.ScreenSaver.GetActive'], timeout=1, stderr=subprocess.DEVNULL).decode().lower()
+            if 'boolean true' in out: return True
+            if 'boolean false' in out: return False
+        except Exception:
+            return None
+        return None
 
     def _write_status(self, status: Dict[str, Any]) -> None:
         """Atomically write status JSON.

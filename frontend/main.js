@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 // Entry point for Electron frontend
-const {app, BrowserWindow, ipcMain, Tray, Menu, nativeImage} = require('electron');
+const {app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, powerMonitor} = require('electron');
 let tray = null;
 function resolveIconPath() {
   const p = path.join(__dirname, 'hindsight_icon.png');
@@ -87,6 +87,94 @@ let lastSequenceTs = 0; // timestamp of last sequence advancement
 let lastServiceInstance = null; // to detect restarts and reset sequence baseline
 let consecutiveUnidentified = 0; // track consecutive UnidentifiedImageError statuses
 let backendSwitchReason = null; // reason for a forced backend change persisted for next spawn
+let systemPaused = false; // true while system is locked/suspended and capture intentionally paused
+let lastPolledLockState = null; // track last known lock state (linux)
+
+function pauseCaptureForSystem(kind) {
+  if (systemPaused) return;
+  systemPaused = true;
+  broadcast('log:line', '[lifecycle] capture paused (system)');
+  const pid = readPid();
+  if (pid) {
+    try { process.kill(pid, 'SIGTERM'); } catch(_) {}
+    setTimeout(()=>{ try { if (readPid() === pid) process.kill(pid, 'SIGKILL'); } catch(_) {} }, 1000);
+  }
+}
+
+function resumeCaptureAfterSystem(kind) {
+  if (!systemPaused) return;
+  broadcast('log:line', '[lifecycle] capture resumed (system)');
+  systemPaused = false;
+  if (!readPid() && !userRequestedStop) {
+    // slight delay to allow display/session to fully restore
+    setTimeout(()=>{ if (!readPid() && !userRequestedStop) startDetached(prefs.interval||5); }, 1200);
+  }
+}
+
+function setupLinuxLockPolling() {
+  if (process.platform !== 'linux') return;
+  const username = os.userInfo().username;
+  const {spawnSync} = require('child_process');
+  function loginctlSessionId() {
+    let sid = process.env.XDG_SESSION_ID || null;
+    if (sid) return sid;
+    try {
+      const out = spawnSync('loginctl', ['list-sessions', '--no-legend']).stdout.toString();
+      for (const line of out.split(/\n/)) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 2 && parts[1] === username) return parts[0];
+      }
+    } catch(_) {}
+    return null;
+  }
+  function tryLoginctl() {
+    const sid = loginctlSessionId();
+    if (!sid) return null;
+    try {
+      const out = spawnSync('loginctl', ['show-session', sid, '-p', 'LockedHint']).stdout.toString();
+      const m = out.match(/LockedHint=(yes|no)/i);
+      if (m) return m[1].toLowerCase() === 'yes';
+    } catch(_) {}
+    return null;
+  }
+  function tryDbusScreensaver() {
+    // GNOME
+    try {
+      const out = spawnSync('gdbus', ['call','--session','--dest','org.gnome.ScreenSaver','--object-path','/org/gnome/ScreenSaver','--method','org.gnome.ScreenSaver.GetActive']).stdout.toString();
+      if (/true/i.test(out)) return true; if (/false/i.test(out)) return false;
+    } catch(_) {}
+    // freedesktop / KDE
+    try {
+      const out = spawnSync('qdbus', ['org.freedesktop.ScreenSaver','/ScreenSaver','GetActive']).stdout.toString();
+      if (/^true/i.test(out.trim())) return true; if (/^false/i.test(out.trim())) return false;
+    } catch(_) {}
+    try {
+      const out = spawnSync('dbus-send', ['--session','--print-reply','--dest=org.freedesktop.ScreenSaver','/ScreenSaver','org.freedesktop.ScreenSaver.GetActive']).stdout.toString();
+      if (/boolean true/.test(out)) return true; if (/boolean false/.test(out)) return false;
+    } catch(_) {}
+    return null;
+  }
+  function detectLocked() {
+    // Order: DBus (fast, DE specific) then loginctl fallback.
+    const dbus = tryDbusScreensaver();
+    if (dbus !== null) return dbus;
+    const lc = tryLoginctl();
+    if (lc !== null) return lc;
+    return null; // unknown
+  }
+  function poll() {
+    if (systemPaused && userRequestedStop) {
+      // user explicitly stopped while paused; don't auto resume later
+    }
+    const state = detectLocked();
+    if (state !== null && state !== lastPolledLockState) {
+      lastPolledLockState = state;
+      if (state) pauseCaptureForSystem('lock-detect'); else resumeCaptureAfterSystem('lock-detect');
+    }
+    setTimeout(poll, 4000);
+  }
+  poll();
+}
 
 function scanForOtherCaptureProcesses(callback) {
   // Linux/mac/macOS/WSL: use ps to detect stray capture.cli processes.
@@ -302,7 +390,7 @@ function pollStatus() {
       lastHeartbeat = nowTs;
     }
     const threshold = lastSuccessfulStatus === 0 ? 1 : 3; // before first success, restart on first display error
-  if (!userRequestedStop && consecutiveDisplayErrors >= threshold) {
+  if (!userRequestedStop && !systemPaused && consecutiveDisplayErrors >= threshold) {
       const now = Date.now();
       if (now - lastHealthRestart > 15000) { // 15s cooldown
   broadcast('log:line', '[health] Display error detected repeatedly; scheduling restart');
@@ -322,7 +410,7 @@ setTimeout(pollStatus, 1500);
 setInterval(() => {
   const pid = readPid();
   if (!pid) return;
-  if (lastSequence !== -1 && Date.now() - lastSequenceTs > 20000) {
+  if (!systemPaused && lastSequence !== -1 && Date.now() - lastSequenceTs > 20000) {
     broadcast('log:line', '[health] capture appears stalled (no sequence advance >20s); restarting');
     internalStopForHealth();
     setTimeout(()=>{ if (!userRequestedStop) startDetached(prefs.interval||5); }, 1200);
@@ -614,6 +702,20 @@ app.whenReady().then(() => {
     const i = resolveIconPath();
     if (i) { try { app.dock.setIcon(i); } catch(_) {} }
   }
+  // System power/session events
+  try {
+    powerMonitor.on('lock-screen', ()=> pauseCaptureForSystem('lock'));
+    powerMonitor.on('unlock-screen', ()=> resumeCaptureAfterSystem('lock'));
+    // Newer Electron exposes session-lock/unlock (cross-platform); include for broader Linux DE coverage
+    if (powerMonitor.on) {
+      powerMonitor.on('session-lock', ()=> pauseCaptureForSystem('session-lock'));
+      powerMonitor.on('session-unlock', ()=> resumeCaptureAfterSystem('session-lock'));
+    }
+    powerMonitor.on('suspend', ()=> pauseCaptureForSystem('suspend'));
+    powerMonitor.on('resume', ()=> resumeCaptureAfterSystem('suspend'));
+    powerMonitor.on('shutdown', ()=> pauseCaptureForSystem('shutdown'));
+  } catch(e) { broadcast('log:line', `[error] powerMonitor setup failed: ${e.message}`); }
+  setupLinuxLockPolling();
   broadcast('log:line', '[lifecycle] app ready, supervision initialized');
 });
 
