@@ -1,0 +1,26 @@
+[run]
+source =
+    capture
+    search
+
+[report]
+show_missing = True
+skip_empty = True
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.
+[run]
+# measure only package sources during test runs invoked from tests/
+source =
+    capture
+    search
+
+branch = True
+omit =
+    tests/*
+    */tests/*
+    frontend/*
+
+[report]
+show_missing = True
+skip_empty = True
