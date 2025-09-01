@@ -51,4 +51,4 @@ venv/
 *.swp
 
 # Automatic Test Reports
-tests/auto-test-reports/
+tests/auto-test-reports/test-reports*

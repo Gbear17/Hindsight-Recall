@@ -4,6 +4,7 @@ import capture.cli as cli
 import capture.service as service
 import signal
 import types
+import time
 
 
 def test_parse_args_defaults():
@@ -30,11 +31,12 @@ def test_main_print_status(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, 'build_default_service', lambda base_dir, interval=5.0: DummyService())
     # Prevent an infinite loop: set stop_signaled after one sleep
-    monkeypatch.setattr('signal.pause', lambda: None)
+    # Patch the real signal and time modules so we don't accidentally miss the target
+    monkeypatch.setattr(signal, 'pause', lambda: None)
     # prevent lock acquisition path in cli (fcntl present in test env)
     monkeypatch.setattr(cli, 'fcntl', None)
     # Run main with --print-status but break quickly by monkeypatching time.sleep to raise KeyboardInterrupt
-    monkeypatch.setattr('time.sleep', lambda s: (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr(time, 'sleep', lambda s: (_ for _ in ()).throw(KeyboardInterrupt()))
     # Should return 0 on normal exit
     rc = cli.main(['--print-status', '--status-interval', '0.01'])
     assert rc == 0

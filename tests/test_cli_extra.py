@@ -1,6 +1,7 @@
 import os
 import time
 import types
+import signal
 from pathlib import Path
 
 import capture.cli as cli
@@ -27,19 +28,14 @@ def test_main_print_status(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(cli, 'fcntl', None)
 
     # Run main with --print-status and short status_interval; ensure it prints at least once
-    def run_once_sleep(secs):
-        # trigger a stop after first sleep by setting stop_signaled via sending KeyboardInterrupt
-        raise KeyboardInterrupt()
-
-    monkeypatch.setattr('time.sleep', lambda s: (_ for _ in ()).throw(KeyboardInterrupt()))
+    # trigger a stop after first sleep by raising KeyboardInterrupt from time.sleep
+    import time as _time
+    monkeypatch.setattr(_time, 'sleep', lambda s: (_ for _ in ()).throw(KeyboardInterrupt()))
 
     rc = None
-    try:
-        rc = cli.main(["--print-status", "--status-interval", "0.01"])
-    except SystemExit as e:
-        rc = e.code
+    rc = cli.main(["--print-status", "--status-interval", "0.01"])
     # main returns 0 on clean exit
-    assert rc in (0, None)
+    assert rc == 0
 
 
 def test_pidfile_stale(monkeypatch, tmp_path):
@@ -50,5 +46,7 @@ def test_pidfile_stale(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "build_default_service", lambda base_dir, interval: DummyService())
     # avoid lock file short-circuit
     monkeypatch.setattr(cli, 'fcntl', None)
+    # prevent blocking on signal.pause() in cli.main (non --print-status path)
+    monkeypatch.setattr(signal, 'pause', lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
     rc = cli.main(["--pid-file", str(pid_file)])
     assert rc == 0
