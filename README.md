@@ -263,4 +263,28 @@ python -m pytest tests/test_service_behavior.py::test_capture_once_happy_path -q
 
 If your environment includes FAISS/transformers and you want to run the heavier semantic tests, install the optional deps (see `requirements.txt` and comments in `search/semantic.py`).
 
+## Verify CI / Test runs
+
+- On GitHub
+  - Go to the repository "Actions" tab → open the latest "CI" workflow run.
+  - A green check = all jobs passed; a red X = one or more jobs failed.
+  - Open the `test` job to view step logs; pytest prints a summary (passed/failed/skipped) and non‑zero exit causes job failure.
+  - Download artifacts from the workflow run (artifact name: `test-reports`) to get:
+    - reports/junit.xml — JUnit results and failure stack traces.
+    - coverage.xml — coverage report (CI enforces the coverage threshold).
+
+- Using gh CLI
+  - List runs: `gh run list --workflow ci.yml`
+  - View logs for the latest run: `gh run view --log <run-id>`
+  - Download artifacts: `gh run download <run-id> --name test-reports`
+
+- Locally (run the same command as CI)
+  - Install deps: `python -m pip install --upgrade pip && if [ -f requirements.txt ]; then pip install -r requirements.txt; fi && pip install pytest pytest-cov`
+  - Run tests: `pytest --cov=./ --cov-report=term --cov-report=xml --cov-fail-under=70 --junitxml=reports/junit.xml`
+  - Inspect `reports/junit.xml` and `coverage.xml` in the repo after the run.
+
+Notes
+- If CI did not trigger, ensure the workflow file is present at `.github/workflows/ci.yml` and the branch is `main`.
+- To add a visible badge later, integrate coverage uploader (Codecov or Coveralls) and add the badge to the README.
+
 

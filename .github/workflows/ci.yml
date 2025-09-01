@@ -38,7 +38,8 @@ jobs:
       - name: Run tests (pytest + coverage)
         run: |
           mkdir -p reports
-          pytest --cov=./ --cov-report=xml --cov-report=term --cov-fail-under=${{ env.COVERAGE_FAIL_UNDER }} --junitxml=reports/junit.xml
+          # produce term-missing, xml, and html reports so we can inspect uncovered lines
+          pytest --cov=./ --cov-report=term-missing --cov-report=xml --cov-report=html --cov-fail-under=${{ env.COVERAGE_FAIL_UNDER }} --junitxml=reports/junit.xml
         continue-on-error: false
 
       - name: Upload test artifacts
@@ -49,4 +50,5 @@ jobs:
           path: |
             reports/
             coverage.xml
+            htmlcov/
             junit.xml
