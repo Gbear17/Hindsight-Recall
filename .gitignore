@@ -49,3 +49,6 @@ venv/
 # OS / editor
 .DS_Store
 *.swp
+
+# Automatic Test Reports
+tests/auto-test-reports/

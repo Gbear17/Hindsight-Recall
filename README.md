@@ -287,4 +287,36 @@ Notes
 - If CI did not trigger, ensure the workflow file is present at `.github/workflows/ci.yml` and the branch is `main`.
 - To add a visible badge later, integrate coverage uploader (Codecov or Coveralls) and add the badge to the README.
 
+## Running tests and summarizing locally
+
+When running tests locally you can reproduce the CI behavior and generate artifacts that this repository's helper script will collect into a timestamped folder under `tests/auto-test-reports`.
+
+Recommended quick steps (from repo root):
+
+```bash
+# (optional) create and activate venv
+python -m venv .venv
+source .venv/bin/activate
+
+# install test deps
+python -m pip install --upgrade pip
+pip install -r requirements.txt || true
+pip install pytest pytest-cov
+
+# run pytest and write xml/html outputs into a timestamped folder under tests/auto-test-reports
+pytest --maxfail=1 --disable-warnings -q --cov=./ --cov-report=xml --cov-report=html --junitxml=tests/auto-test-reports/reports/junit.xml
+```
+
+After the run the helper will automatically copy the generated artifacts into a timestamped `tests/auto-test-reports/test-reports_<ISO>` folder. To inspect a downloaded workflow artifact or a saved folder, run:
+
+```bash
+python tests/auto-test-reports/parse_junit_and_coverage.py /path/to/downloaded/test-reports
+# or just:
+python tests/auto-test-reports/parse_junit_and_coverage.py    # auto-detects latest under tests/auto-test-reports
+```
+
+The helper prints a short junit summary, top slow tests, overall line coverage, and the top files by missed lines.
+
+If you want the parser to only analyze and not copy artifacts, run it with `--no-save` (coming soon).
+
 
