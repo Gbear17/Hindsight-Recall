@@ -230,4 +230,37 @@ npm install --save-dev electron-builder
 npx electron-builder
 ```
 
+## Testing
+
+Unit tests are implemented with pytest. Tests avoid requiring a live display or heavyweight ML/model downloads by providing fixtures that stub display and image operations.
+
+Quick start (inside the project root):
+
+```bash
+# (optional) create and activate a virtualenv
+python -m venv .venv
+source .venv/bin/activate
+
+# install test/runtime deps
+pip install -r requirements.txt
+pip install pytest Pillow cryptography
+
+# run the full test suite
+python -m pytest -q
+```
+
+Helpful notes:
+- The test fixtures live in `tests/conftest.py` and include:
+  - `stub_image_open` — stubs `PIL.Image.open` to avoid needing real PNG files.
+  - `stub_capture_region` — writes placeholder bytes instead of performing an actual screen grab.
+  - `stub_extract_text` — stubs OCR extraction to return a small string.
+  - `stub_get_active_window` — supplies a deterministic active-window object.
+- If you want to run a single test file or test function, pass its path to pytest, for example:
+
+```bash
+python -m pytest tests/test_service_behavior.py::test_capture_once_happy_path -q
+```
+
+If your environment includes FAISS/transformers and you want to run the heavier semantic tests, install the optional deps (see `requirements.txt` and comments in `search/semantic.py`).
+
 

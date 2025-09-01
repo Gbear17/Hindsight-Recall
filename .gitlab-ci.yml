@@ -1,0 +1,30 @@
+stages:
+  - test
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  COVERAGE_FAIL_UNDER: "70"
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .cache/pip/
+
+test:
+  stage: test
+  image: python:3.11
+  before_script:
+    - python -m pip install --upgrade pip
+    - mkdir -p reports
+    # install project requirements if present; continue if requirements.txt missing
+    - if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - pip install pytest pytest-cov
+  script:
+    - pytest --cov=./ --cov-report=xml --cov-report=term --cov-fail-under=$COVERAGE_FAIL_UNDER --junitxml=reports/junit.xml
+  artifacts:
+    paths:
+      - reports/
+      - coverage.xml
+    expire_in: 1 week
+    when: always
+  allow_failure: false
