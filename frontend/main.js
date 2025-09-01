@@ -84,6 +84,9 @@ let lastInstanceId = null; // track capture service instance to avoid false anom
 let lastSequence = -1; // monotonic status sequence to skip stale overwrites
 let lastStatusUtc = null; // track last_capture_utc for legacy comparisons
 let lastSequenceTs = 0; // timestamp of last sequence advancement
+let lastServiceInstance = null; // to detect restarts and reset sequence baseline
+let consecutiveUnidentified = 0; // track consecutive UnidentifiedImageError statuses
+let backendSwitchReason = null; // reason for a forced backend change persisted for next spawn
 
 function scanForOtherCaptureProcesses(callback) {
   // Linux/mac/macOS/WSL: use ps to detect stray capture.cli processes.
@@ -154,6 +157,9 @@ function startDetached(interval) {
   if (prefs.backend && prefs.backend !== 'auto') {
     env.HINDSIGHT_FORCE_BACKEND = prefs.backend;
   }
+  if (backendSwitchReason) {
+    env.HINDSIGHT_BACKEND_SWITCH_REASON = backendSwitchReason;
+  }
   const proc = spawn(args[0], args.slice(1), {detached: true, stdio:'ignore', cwd: projectRoot(), env});
   proc.unref();
   broadcast('log:line', `[control] started capture (interval=${interval||5}s)`);
@@ -205,14 +211,36 @@ function pollStatus() {
       } else {
         consecutiveDisplayErrors = 0;
       }
+      // Auto backend adaptation: if imagegrab keeps producing UnidentifiedImageError, switch prefs.backend to 'mss' and restart once.
+      if (/UnidentifiedImageError/.test(err) && /imagegrab/.test(String(data.capture_backend||''))) {
+        consecutiveUnidentified++;
+        if (consecutiveUnidentified === 3) {
+          if (prefs.backend !== 'mss') {
+            broadcast('log:line', '[health] repeated UnidentifiedImageError with imagegrab; switching backend to mss and restarting');
+            prefs.backend = 'mss';
+            savePrefs(prefs);
+            backendSwitchReason = 'imagegrab_unidentifiedimageerror';
+            internalStopForHealth();
+            setTimeout(()=>{ if (!userRequestedStop) startDetached(prefs.interval||5); }, 1000);
+          }
+        }
+      } else if (!/UnidentifiedImageError/.test(err)) {
+        consecutiveUnidentified = 0;
+      }
     } else {
       consecutiveDisplayErrors = 0;
       lastSuccessfulStatus = Date.now();
+      consecutiveUnidentified = 0;
     }
     // Emit capture / error change logs
     if (data) {
       // Skip stale status (older sequence or missing sequence after we've seen one)
       if (typeof data.sequence === 'number') {
+        // Detect instance change earlier (before stale check) so we can accept a lower sequence
+        if (data.service_instance_id && lastServiceInstance && data.service_instance_id !== lastServiceInstance) {
+          broadcast('log:line', `[lifecycle] new service instance detected (sequence baseline reset) ${data.service_instance_id}`);
+          lastSequence = -1; // reset baseline to accept new lower sequence
+        }
         if (lastSequence !== -1 && data.sequence < lastSequence) {
           broadcast('log:line', `[stale] ignoring out-of-order status sequence=${data.sequence} < ${lastSequence}`);
           return; // do not process further
@@ -239,10 +267,14 @@ function pollStatus() {
           broadcast('log:line', `[anomaly] capture_count regressed from ${lastLoggedCaptureCount} to ${data.capture_count}; possible stale secondary process`);
         }
         lastLoggedCaptureCount = data.capture_count;
+      } else if (data.duplicate === true) {
+        // Explicitly log duplicate frame skipped to surface suppression behavior.
+        broadcast('log:line', `[duplicate] skipped frame (same as previous) window="${data.window_title}"`);
       }
       if (typeof data.sequence === 'number' && data.sequence > lastSequence) {
         lastSequence = data.sequence;
-  lastSequenceTs = Date.now();
+        lastSequenceTs = Date.now();
+        if (data.service_instance_id) lastServiceInstance = data.service_instance_id;
       }
       if (!data.sequence && lastInstanceId) {
         // Legacy/no-sequence status after we've seen a proper instance id => likely stale or competing writer.
@@ -363,14 +395,28 @@ function createLinuxAutostart(py, args) {
   else if (deEnv.includes('lxqt') || deEnv.includes('lxde')) deTag = 'lxqt';
   else if (deEnv.includes('mate')) deTag = 'mate';
   const delay = Number(prefs.delaySeconds || 0);
-  // Ensure we run from project root so the 'capture' package is importable
-  const baseCmd = `cd \"${projectRoot()}\" && \"${py}\" ${args.map(a=>`\"${a}\"`).join(' ')}`;
-  const execLine = delay > 0 ? `sh -c \"sleep ${delay}; ${baseCmd}\"` : baseCmd;
+  const effectiveDelay = delay < 8 ? 8 : delay; // ensure session fully up (panels, DISPLAY perms)
+  // Create a wrapper script to avoid complex Exec quoting & ensure environment readiness.
+  const pr = projectRoot();
+  const dataDir = path.join(pr, 'data');
+  const wrapperPath = path.join(pr, 'hindsight_capture_wrapper.sh');
+  const backendEnv = (prefs.backend && prefs.backend !== 'auto') ? `export HINDSIGHT_FORCE_BACKEND=${prefs.backend}\n` : '';
+  // Determine Electron launch command.
+  // In dev we assume running from repo with node_modules; attempt 'npx electron'.
+  const electronCmd = process.env.HINDSIGHT_ELECTRON_CMD || 'npx electron';
+  const script = `#!/usr/bin/env bash\nset -euo pipefail\nLOGDIR=\"${dataDir}\"\nmkdir -p \"$LOGDIR\"\nTS() { date -Iseconds; }\nlog() { echo \"$(TS) [wrapper] $*\" >> \"$LOGDIR/autostart.log\"; }\nlog start pid=$$ DISPLAY=$DISPLAY USER=$USER\n${effectiveDelay>0?`sleep ${effectiveDelay}\n`:''}cd \"${pr}\"\nexport HINDSIGHT_AUTOSTART=1\nlog launching electron interval=${prefs.interval||5} backend=${prefs.backend||'auto'} cmd='${electronCmd}'\n( ${electronCmd} frontend/main.js >> \"$LOGDIR/electron.autostart.out\" 2>&1 & echo $! > \"$LOGDIR/autostart.spawned.pid\" )\nSPAWNED=$(cat \"$LOGDIR/autostart.spawned.pid\")\nlog spawned electron_pid=$SPAWNED\n`;
+  try {
+    fs.writeFileSync(wrapperPath, script, {mode: 0o755});
+  } catch (e) {
+    broadcast('log:line', `[error] failed writing wrapper script: ${e.message}`);
+  }
+  const execLine = wrapperPath; // simpler & robust
   const chosenIcon = path.join(projectRoot(), 'frontend', 'hindsight_icon.png');
   const iconLine = fs.existsSync(chosenIcon) ? `Icon=${chosenIcon}\n` : '';
-  const content = `[Desktop Entry]\nType=Application\nVersion=1.0\nName=Hindsight Recall Capture\nComment=Background capture service (auto-start)\nExec=${execLine}\n${iconLine}X-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\nX-Desktop-Environment=${deTag}\nTerminal=false\nCategories=Utility;\n`;
+  const onlyShowInLine = deTag === 'kde' ? 'OnlyShowIn=KDE;\n' : '';
+  const content = `[Desktop Entry]\nType=Application\nVersion=1.0\nName=Hindsight Recall Capture\nComment=Background capture service (auto-start)\nExec=${execLine}\n${iconLine}X-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\nX-Desktop-Environment=${deTag}\n${onlyShowInLine}Terminal=false\nHidden=false\nCategories=Utility;\n`;
   fs.writeFileSync(p.file, content, {mode: 0o644});
-  return {deTag, delay, file: p.file};
+  return {deTag, delay: effectiveDelay, file: p.file, mode: 'electron'};
 }
 
 function enableAutostart(enable) {
@@ -395,6 +441,7 @@ function enableAutostart(enable) {
   }
   prefs.autostart = true;
   savePrefs(prefs);
+  broadcast('log:line', `[lifecycle] autostart enabled file=${p.file}`);
   return true;
 }
 
@@ -420,8 +467,27 @@ function validateAutostart() {
       if (!map.Type || map.Type !== 'Application') result.issues.push('Type is missing or not Application');
       if (!result.exec) result.issues.push('Exec line missing');
       else {
-        if (!result.exec.includes('capture') || !result.exec.includes('--interval')) result.issues.push('Exec line may be incomplete');
-        // crude check for quoting issues
+        // Heuristic validation: legacy direct python invocation included 'capture' and '--interval'.
+        // Current design uses a wrapper script (hindsight_capture_wrapper.sh) that launches Electron.
+        const execPath = result.exec.split(/\s+/)[0];
+        const isWrapper = /hindsight_capture_wrapper\.sh$/.test(execPath);
+        if (!isWrapper) {
+          if (!result.exec.includes('capture') || !result.exec.includes('--interval')) {
+            result.issues.push('Exec line may be incomplete');
+          }
+        } else {
+          // For wrapper, ensure file exists & is executable.
+          try {
+            if (!fs.existsSync(execPath)) result.issues.push('Wrapper script missing: ' + execPath);
+            else {
+              const st = fs.statSync(execPath);
+              if (!(st.mode & 0o111)) result.issues.push('Wrapper script not executable: ' + execPath);
+            }
+          } catch (e) {
+            result.issues.push('Wrapper validation error: ' + e.message);
+          }
+        }
+        // crude check for quoting issues (still applies)
         if ((result.exec.match(/"/g) || []).length % 2 !== 0) result.issues.push('Unbalanced quotes in Exec line');
       }
     } else if (p.type === 'mac') {
@@ -533,7 +599,13 @@ function ensureLinuxAppLauncher() {
 }
 
 app.whenReady().then(() => {
-  createWindow();
+  const autostartMode = process.env.HINDSIGHT_AUTOSTART === '1';
+  if (!autostartMode) {
+    createWindow();
+  } else {
+    // In autostart mode we stay in tray only until user clicks tray item.
+    broadcast('log:line', '[lifecycle] autostart tray-only mode (no initial window)');
+  }
   createTray();
   startDetached(prefs.interval || 5);
   ensureLinuxAppLauncher();

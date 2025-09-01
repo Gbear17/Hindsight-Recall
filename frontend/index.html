@@ -29,7 +29,8 @@
       <strong>Autostart Validation</strong>
       <div id="validationBody" style="font-size:12px;white-space:pre-wrap;margin-top:4px;"></div>
     </div>
-    <div id="status">Waiting for first capture...</div>
+  <div id="status">Waiting for first capture...</div>
+  <div id="backendInfo" style="margin-top:4px;font-size:12px;color:#333;display:none;"></div>
   <div id="staleWarning" style="display:none;color:#b00;font-weight:bold;margin-top:4px;">Status stale: no recent capture activity.</div>
     <div style="margin:6px 0;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
       <button id="btnStart">Start Capture</button>
@@ -113,6 +114,9 @@
       let lastStatusTime = null;
       let lastIntervalSeconds = 5; // default, updated from prefs
       window.hindsight.getPrefs().then(p=>{ if (p && p.interval) lastIntervalSeconds = p.interval; }).catch(()=>{});
+      let lastBackend = null;
+      let lastSwitchReason = null;
+      let lastSwitchLocalTs = null;
       window.hindsight.onStatus((s) => {
         lastStatusTime = Date.now();
         if (s.interval) lastIntervalSeconds = s.interval; // if backend includes
@@ -129,6 +133,28 @@
         } else {
           errEl.textContent = '';
         }
+        // Backend / switch reason surfacing
+        const backendInfoEl = document.getElementById('backendInfo');
+        let changed = false;
+        if (s.capture_backend && s.capture_backend !== lastBackend) {
+          changed = true;
+        }
+        if (s.backend_switch_reason) {
+          lastSwitchReason = s.backend_switch_reason;
+          lastSwitchLocalTs = Date.now();
+        }
+        if (s.capture_backend || lastSwitchReason) {
+          backendInfoEl.style.display = 'block';
+          const parts = [];
+          if (s.capture_backend) parts.push('Backend: ' + s.capture_backend);
+          if (lastSwitchReason) {
+            let when = '';
+            if (lastSwitchLocalTs) when = ' at ' + new Date(lastSwitchLocalTs).toLocaleTimeString();
+            parts.push('Last switch reason: ' + lastSwitchReason + when);
+          }
+          backendInfoEl.textContent = parts.join(' | ');
+        }
+        if (s.capture_backend) lastBackend = s.capture_backend;
       });
       window.hindsight.onLog((msg) => {
         const raw = document.getElementById('raw');

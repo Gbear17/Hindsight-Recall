@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import json
 from datetime import datetime, timezone
+import hashlib
 
 from .screenshot import generate_filename
 from .ocr import extract_text, ocr_text_filename
@@ -55,11 +56,13 @@ class CaptureService:
         self._instance_id = uuid4().hex
         self._started_utc = datetime.now(timezone.utc).isoformat()
         self._sequence = 0  # monotonic sequence for each status write (error or success)
+        self._last_image_hash = None  # hash of previous raw PNG to detect duplicates
+        self._consecutive_unidentified = 0  # track consecutive UnidentifiedImageError occurrences
+        self._backend_switch_reason = os.environ.get('HINDSIGHT_BACKEND_SWITCH_REASON') or None
+        # Ensure directories & key
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.enc_dir.mkdir(parents=True, exist_ok=True)
         self._load_or_create_key()
-        # Initialize capture count from existing encrypted images so the
-        # counter reflects all currently stored captures, not just this session.
         try:
             self._capture_count = sum(1 for _ in self.enc_dir.glob('*.png.enc'))
         except Exception:  # pragma: no cover - best effort
@@ -95,6 +98,19 @@ class CaptureService:
                 self._capture_once()
             except Exception as exc:  # pragma: no cover - safety net
                 LOGGER.exception("Capture cycle failed: %s", exc)
+                # Backend auto-adaptation: if repeated UnidentifiedImageError under ImageGrab, force mss next cycle.
+                try:
+                    from . import active_window as _aw  # type: ignore
+                    if 'UnidentifiedImageError' in type(exc).__name__ or 'UnidentifiedImageError' in str(exc):
+                        self._consecutive_unidentified += 1
+                        if getattr(_aw, '_BACKEND', '') == 'imagegrab' and self._consecutive_unidentified >= 2:
+                            setattr(_aw, '_BACKEND', 'mss')
+                            setattr(_aw, '_GLOBAL_MSS', None)
+                            LOGGER.warning("Switching capture backend to mss after %s consecutive UnidentifiedImageError failures", self._consecutive_unidentified)
+                    else:
+                        self._consecutive_unidentified = 0
+                except Exception:  # pragma: no cover
+                    pass
                 # Emit an error status so external monitors / UI can surface the issue.
                 self._sequence += 1
                 err_status = {
@@ -125,8 +141,86 @@ class CaptureService:
         info = get_active_window()
         fname = generate_filename(info.title)
         img_path = self.output_dir / fname
-        capture_region(info.bbox, str(img_path))
-        # OCR
+        # Capture with automatic fallback: if ImageGrab yields UnidentifiedImageError, switch to mss and retry once.
+        try:
+            capture_region(info.bbox, str(img_path))
+        except Exception as exc:
+            if 'UnidentifiedImageError' in type(exc).__name__ or 'UnidentifiedImageError' in str(exc):
+                try:
+                    from . import active_window as _aw  # type: ignore
+                    # Force backend reset to mss and retry one time.
+                    _aw._BACKEND = 'mss'  # type: ignore[attr-defined]
+                    _aw._GLOBAL_MSS = None  # type: ignore[attr-defined]
+                    capture_region(info.bbox, str(img_path))
+                except Exception:
+                    raise  # propagate original failure chain
+            else:
+                raise
+        # Validate that the file is a readable PNG; ImageGrab can sometimes write
+        # a zero-byte or corrupt file on some desktops. If unreadable, retry once
+        # with forced mss backend before giving up.
+        try:
+            from PIL import Image  # type: ignore
+            with Image.open(img_path) as im:  # noqa: F841
+                im.verify()  # lightweight integrity check
+        except Exception as exc:  # UnidentifiedImageError or others
+            if 'UnidentifiedImageError' in type(exc).__name__ or 'cannot identify image file' in str(exc):
+                try:
+                    # Remove bad file
+                    try:
+                        img_path.unlink()
+                    except Exception:
+                        pass
+                    from . import active_window as _aw  # type: ignore
+                    _aw._BACKEND = 'mss'  # type: ignore[attr-defined]
+                    _aw._GLOBAL_MSS = None  # type: ignore[attr-defined]
+                    # Retry capture once using mss
+                    capture_region(info.bbox, str(img_path))
+                    # Re-validate
+                    from PIL import Image as _Image  # type: ignore
+                    with _Image.open(img_path) as _im:  # noqa: F841
+                        _im.verify()
+                except Exception:
+                    # Give up; raise original so outer loop records error status
+                    raise
+            else:
+                raise
+        # Compute hash to detect duplicate frame before heavy work (OCR/encrypt)
+        try:
+            raw_bytes = img_path.read_bytes()
+            current_hash = hashlib.sha256(raw_bytes).hexdigest()
+        except Exception:  # pragma: no cover - best effort
+            current_hash = None  # type: ignore
+            raw_bytes = None  # type: ignore
+        duplicate = self._last_image_hash is not None and current_hash == self._last_image_hash
+        if duplicate:
+            # Remove newly captured duplicate file; do not increment capture_count; still emit status.
+            try:
+                img_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+            except Exception:  # pragma: no cover
+                pass
+            self._sequence += 1
+            status = {
+                "last_capture_utc": datetime.now(timezone.utc).isoformat(),
+                "window_title": info.title,
+                "window_bbox": info.bbox,
+                "encrypted_image": None,
+                "encrypted_text": None,
+                "capture_count": self._capture_count,  # unchanged
+                "interval_sec": self.interval,
+                "display_env": os.environ.get('DISPLAY'),
+                "session_type": os.environ.get('XDG_SESSION_TYPE'),
+                "process_pid": os.getpid(),
+                "capture_backend": get_backend(),
+                "service_instance_id": self._instance_id,
+                "service_start_utc": self._started_utc,
+                "sequence": self._sequence,
+                "duplicate": True,
+            }
+            self._last_status = status
+            self._write_status(status)
+            return
+        # OCR (only for non-duplicate)
         text = extract_text(img_path)
         txt_path = self.output_dir / ocr_text_filename(fname)
         txt_path.write_text(text, encoding="utf-8")
@@ -143,12 +237,14 @@ class CaptureService:
                 img_path.unlink()
             if txt_path.exists():
                 txt_path.unlink()
-        # Recount encrypted image captures ( authoritative ).
+        # Recount encrypted image captures (authoritative).
         try:
             self._capture_count = sum(1 for _ in self.enc_dir.glob('*.png.enc'))
         except Exception:  # pragma: no cover
             pass
         self._sequence += 1
+        if current_hash:
+            self._last_image_hash = current_hash
         status = {
             "last_capture_utc": datetime.now(timezone.utc).isoformat(),
             "window_title": info.title,
@@ -164,7 +260,11 @@ class CaptureService:
             "service_instance_id": self._instance_id,
             "service_start_utc": self._started_utc,
             "sequence": self._sequence,
+            "duplicate": False,
+            "backend_switch_reason": self._backend_switch_reason,
         }
+        # Only include switch reason on first success after a switch, then clear.
+        self._backend_switch_reason = None
         self._last_status = status
         self._write_status(status)
         LOGGER.debug(

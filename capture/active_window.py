@@ -140,9 +140,20 @@ def capture_region(bbox: Tuple[int, int, int, int], output_path: str) -> None:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("Pillow ImageGrab backend not available") from exc
         box = (left, top, left + width, top + height)
-        img = ImageGrab.grab(bbox=box)  # type: ignore
-        img.save(output_path, format='PNG')
-        return
+        try:
+            img = ImageGrab.grab(bbox=box)  # type: ignore
+            img.save(output_path, format='PNG')
+            return
+        except Exception as exc:  # pragma: no cover - transient backend issues
+            # ImageGrab on some Linux/Wayland setups may intermittently create a temp file
+            # that Pillow then cannot re-open (UnidentifiedImageError). When that occurs
+            # we attempt to fall back to a fresh mss instance on next invocation.
+            name = type(exc).__name__
+            if 'UnidentifiedImageError' in name:
+                _GLOBAL_MSS = None
+                _BACKEND = 'mss'  # force re-attempt with mss path next call
+                raise RuntimeError(f"ImageGrab produced invalid image (will retry with mss): {exc}") from exc
+            raise
     # mss backend path
     attempt = 0
     while attempt < 2:  # initial + one retry

@@ -2,5 +2,5 @@
   "autostart": true,
   "interval": 5,
   "delaySeconds": 10,
-  "backend": "imagegrab"
+  "backend": "mss"
 }

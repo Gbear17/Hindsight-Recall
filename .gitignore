@@ -1,15 +1,49 @@
-.venv/
-__pycache__/
+# --- capture runtime & user state ---
+data/frontend.log
+data/autostart.log
+data/*autostart*.out
+data/capture.autostart.out
+data/electron.autostart.out
+data/status.json
+data/prefs.json            # keep a prefs.example.json under version control instead
+data/*.pid
+data/capture.lock
+
+# Encrypted / extracted artifacts (large, personal)
+data/encrypted/**
+data/text/**
+data/ocr/**
+!data/encrypted/.gitkeep
+!data/text/.gitkeep
+!data/ocr/.gitkeep
+
+# Duplicate/diagnostic dumps if any
+data/*.tmp
+data/*.bak
+
+# Autostart wrapper (generated)
+hindsight_capture_wrapper.sh
+
+# Python runtime
+**/__pycache__/
+*.py[cod]
+*.pyo
 *.pyc
-.pytest_cache/
+*.pytest_cache/
+.mypy_cache/
+
+# Node/Electron runtime
 node_modules/
 dist/
+out/
+
+# Virtual envs
+.venv/
+venv/
+
+# Logs at root
 *.log
 
-# User data
-data/encrypted/
-data/plain/
-
-# Editor
-.vscode/
+# OS / editor
+.DS_Store
 *.swp
