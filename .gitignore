@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+dist/
+*.log
+
+# User data
+data/encrypted/
+data/plain/
+
+# Editor
+.vscode/
+*.swp

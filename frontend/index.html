@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Hindsight Recall</title>
+</head>
+<body>
+  <h1>Hindsight Recall</h1>
+  <section>
+    <h2>Capture Status</h2>
+    <label style="display:block;margin-bottom:8px;">
+      <input type="checkbox" id="autostartToggle" /> Run capture on login (background)
+    </label>
+    <div id="prefs" style="margin:8px 0;padding:8px;border:1px solid #ccc;max-width:520px;">
+      <strong>Preferences</strong>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:6px;">
+        <label>Interval (s)
+          <input type="number" id="intervalInput" min="1" value="5" style="width:80px;" />
+        </label>
+        <label>Startup Delay (s)
+          <input type="number" id="delayInput" min="0" value="0" style="width:80px;" />
+        </label>
+        <button id="savePrefsBtn">Save Prefs</button>
+        <button id="validateBtn" title="Validate autostart entry">Validate Autostart</button>
+      </div>
+      <div id="prefsMsg" style="margin-top:6px;font-size:12px;color:#555;"></div>
+    </div>
+    <div id="validation" style="display:none;margin:8px 0;padding:8px;border:1px solid #666;background:#222;color:#ddd;max-width:640px;">
+      <strong>Autostart Validation</strong>
+      <div id="validationBody" style="font-size:12px;white-space:pre-wrap;margin-top:4px;"></div>
+    </div>
+    <div id="status">Waiting for first capture...</div>
+  <div id="staleWarning" style="display:none;color:#b00;font-weight:bold;margin-top:4px;">Status stale: no recent capture activity.</div>
+    <div style="margin:6px 0;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <button id="btnStart">Start Capture</button>
+      <button id="btnStop">Stop Capture</button>
+      <button id="btnPid">Show PID</button>
+      <button id="btnPurge" title="Delete all stored capture artifacts (keeps key)">Purge Data</button>
+      <span id="pidDisplay" style="font-size:12px;color:#444;"></span>
+      <span id="errorDisplay" style="font-size:12px;color:#b00;font-weight:bold;"></span>
+    </div>
+    <pre id="raw" style="background:#111;color:#9f9;padding:8px;max-height:300px;overflow:auto;"></pre>
+  </section>
+  <script>
+    (function init() {
+      if (!window.hindsight) {
+        // Retry shortly until preload exposes API
+        return setTimeout(init, 100);
+      }
+      const raw = document.getElementById('raw');
+      raw.textContent += '\n[ui] Hindsight API ready';
+      // Initialize autostart checkbox
+      window.hindsight.getAutostart().then(enabled => {
+        const cb = document.getElementById('autostartToggle');
+        cb.checked = !!enabled;
+      }).catch(e=>{raw.textContent += '\n[ui] autostart get failed: '+e;});
+
+      document.getElementById('autostartToggle').addEventListener('change', (e) => {
+        window.hindsight.setAutostart(e.target.checked).then(() => {
+          if (e.target.checked) doValidate();
+        }).catch(err=>{raw.textContent += '\n[ui] setAutostart error: '+err;});
+      });
+
+      // Load prefs
+      window.hindsight.getPrefs().then(p => {
+        document.getElementById('intervalInput').value = p.interval || 5;
+        document.getElementById('delayInput').value = p.delaySeconds || 0;
+      }).catch(e=>{raw.textContent += '\n[ui] prefs get failed: '+e;});
+
+      document.getElementById('savePrefsBtn').addEventListener('click', () => {
+        const interval = parseInt(document.getElementById('intervalInput').value, 10) || 5;
+        const delaySeconds = parseInt(document.getElementById('delayInput').value, 10) || 0;
+        const msgEl = document.getElementById('prefsMsg');
+        msgEl.textContent = 'Saving...';
+        window.hindsight.setPrefs({interval, delaySeconds}).then(p => {
+          msgEl.textContent = 'Saved.';
+          if (p.autostart) setTimeout(doValidate, 250);
+        }).catch(err => {
+          msgEl.textContent = 'Error: ' + err;
+        });
+      });
+
+      function doValidate() {
+        const wrap = document.getElementById('validation');
+        const body = document.getElementById('validationBody');
+        wrap.style.display = 'block';
+        body.textContent = 'Validating...';
+        window.hindsight.validateAutostart().then(res => {
+      console.log('[validate] result', res);
+          if (!res.exists) {
+            body.textContent = 'Autostart file not found. (Enable autostart to generate)';
+            if (document.getElementById('autostartToggle').checked) {
+              setTimeout(() => {
+        window.hindsight.validateAutostart().then(r2 => { console.log('[validate] retry', r2); if (r2.exists) doValidate(); }).catch(()=>{});
+              }, 400);
+            }
+            return;
+          }
+            let out = 'File: ' + res.file + '\n';
+            if (res.exec) out += 'Exec: ' + res.exec + '\n';
+            if (!res.issues || res.issues.length === 0) out += '\nStatus: OK';
+            else out += '\nIssues:\n - ' + res.issues.join('\n - ');
+            body.textContent = out;
+        }).catch(err => {
+          console.error('[validate] error', err);
+          body.textContent = 'Validation error: ' + (err && err.message ? err.message : err);
+        });
+      }
+      window.doValidate = doValidate; // expose for console debugging
+      document.getElementById('validateBtn').addEventListener('click', doValidate);
+      setTimeout(doValidate, 600); // initial validation after load & prefs
+
+      let lastStatusTime = null;
+      let lastIntervalSeconds = 5; // default, updated from prefs
+      window.hindsight.getPrefs().then(p=>{ if (p && p.interval) lastIntervalSeconds = p.interval; }).catch(()=>{});
+      window.hindsight.onStatus((s) => {
+        lastStatusTime = Date.now();
+        if (s.interval) lastIntervalSeconds = s.interval; // if backend includes
+        const statusEl = document.getElementById('status');
+        let localStr = s.last_capture_utc;
+        try { localStr = new Date(s.last_capture_utc).toLocaleString(); } catch(_) {}
+        statusEl.textContent = `Last capture (local): ${localStr} | Window: ${s.window_title} | Count: ${s.capture_count}`;
+        document.getElementById('raw').textContent = JSON.stringify(s, null, 2);
+        const warn = document.getElementById('staleWarning');
+        warn.style.display = 'none';
+        const errEl = document.getElementById('errorDisplay');
+        if (s.error) {
+          errEl.textContent = 'Error: ' + s.error;
+        } else {
+          errEl.textContent = '';
+        }
+      });
+      window.hindsight.onLog((msg) => {
+        const raw = document.getElementById('raw');
+        raw.textContent += "\n[log] " + msg;
+      });
+      // Staleness checker: warn if no status within 3 * interval (min 10s grace)
+      function checkStale() {
+        const warn = document.getElementById('staleWarning');
+        const now = Date.now();
+        const thresholdMs = Math.max(10000, (lastIntervalSeconds||5) * 3000); // 3*interval*1000
+        if (!lastStatusTime) {
+          // After initial grace period, show warning if still nothing
+          if (now > thresholdMs + performance.timing.navigationStart) {
+            warn.textContent = 'Status stale: no capture data received yet.';
+            warn.style.display = 'block';
+          }
+        } else if ((now - lastStatusTime) > thresholdMs) {
+          const age = ((now - lastStatusTime)/1000).toFixed(1);
+            warn.textContent = `Status stale: last update ${age}s ago (threshold ${(thresholdMs/1000).toFixed(0)}s).`;
+            warn.style.display = 'block';
+        } else {
+          warn.style.display = 'none';
+        }
+        setTimeout(checkStale, 4000);
+      }
+      setTimeout(checkStale, 6000);
+      // Buttons
+      document.getElementById('btnStart').addEventListener('click', ()=>{
+        const btn = document.getElementById('btnStart');
+        if (btn.dataset.lock === '1') return; // debounce
+        btn.dataset.lock = '1';
+        btn.disabled = true;
+        window.hindsight.captureStart().then(r=>{ 
+          document.getElementById('pidDisplay').textContent = (r && r.action==='already') ? 'Already running' : 'Starting...';
+          setTimeout(refreshPid,700);
+        }).finally(()=>{
+          setTimeout(()=>{ btn.dataset.lock=''; btn.disabled=false; }, 1500);
+        });
+      });
+      document.getElementById('btnStop').addEventListener('click', ()=>{
+        window.hindsight.captureStop().then(()=>{ setTimeout(refreshPid,700);});
+      });
+      document.getElementById('btnPid').addEventListener('click', refreshPid);
+      document.getElementById('btnPurge').addEventListener('click', ()=>{
+        if (!confirm('Delete all stored capture data (encrypted + plaintext artifacts)?')) return;
+        window.hindsight.purgeData().then(r=>{
+          raw.textContent += '\n[ui] Purge removed '+(r.removed||0)+' items';
+          setTimeout(refreshPid, 500);
+        }).catch(e=>{ raw.textContent += '\n[ui] Purge error: '+e; });
+      });
+      function refreshPid(){
+        window.hindsight.captureStatus().then(r=>{
+          document.getElementById('pidDisplay').textContent = r.pid ? ('PID: '+r.pid) : 'Not running';
+        });
+      }
+      setInterval(refreshPid, 5000);
+      refreshPid();
+    })();
+  </script>
+</body>
+</html>

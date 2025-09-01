@@ -1,0 +1,17 @@
+# Python dependencies for Hindsight Recall
+pillow
+pytesseract
+cryptography
+faiss-cpu
+torch
+transformers
+
+# Tooling / style
+pytest
+pylint
+yapf
+ruff
+numpy
+pre-commit
+mss
+psutil

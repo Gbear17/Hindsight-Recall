@@ -1,0 +1,22 @@
+[MASTER]
+ignore=venv
+extension-pkg-whitelist=
+jobs=1
+
+[MESSAGES CONTROL]
+disable=
+    missing-module-docstring,
+    too-few-public-methods
+
+[FORMAT]
+max-line-length=100
+
+[DESIGN]
+max-args=10
+max-attributes=15
+
+[TYPECHECK]
+generated-members=torch.*
+
+[BASIC]
+good-names=i,j,k,ex,Run,_,id
