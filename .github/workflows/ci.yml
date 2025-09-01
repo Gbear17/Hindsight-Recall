@@ -47,11 +47,8 @@ jobs:
 
       - name: Run tests (pytest + coverage)
         run: |
-          # Put CI test artifacts under tests/auto-test-reports in a timestamped folder
-          REPORT_DIR=tests/auto-test-reports/test-reports_$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          # Use REPORT_DIR prepared earlier
           mkdir -p "$REPORT_DIR/reports"
-          # make REPORT_DIR available to later steps in this job
-          echo "REPORT_DIR=$REPORT_DIR" >> $GITHUB_ENV
           # Run pytest via python -m pytest to match local invocation and ensure venv semantics.
           python -m pytest --maxfail=1 --disable-warnings -q --cov=./ \
             --cov-report=term-missing \
@@ -74,4 +71,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-reports
-          path: $REPORT_DIR
+          path: ${{ env.REPORT_DIR }}
