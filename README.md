@@ -287,6 +287,41 @@ Notes
 - If CI did not trigger, ensure the workflow file is present at `.github/workflows/ci.yml` and the branch is `main`.
 - To add a visible badge later, integrate coverage uploader (Codecov or Coveralls) and add the badge to the README.
 
+### Downloading and parsing the latest CI test-reports artifact
+
+CI uploads a `test-reports` artifact containing:
+- `coverage.xml` – overall & per‑file coverage
+- `htmlcov/` – HTML coverage report
+- `reports/junit.xml` – test results (failures, timings)
+
+These artifacts are git‑ignored (not committed). Fetch and parse them with the GitHub CLI:
+
+1. Authenticate (one‑time):
+```bash
+gh auth login
+# Choose: GitHub.com -> HTTPS -> (Y) for git -> browser or paste token (needs repo + workflow read)
+```
+2. List the most recent CI run (optional – shows run id):
+```bash
+gh run list --workflow ci.yml --limit 1
+```
+3. Download the newest successful run's artifact into the workspace reports directory (it will create subfolders):
+```bash
+gh run download --name test-reports --dir tests/auto-test-reports
+```
+  (If there are multiple workflows, specify the run id: `gh run download <run-id> --name test-reports --dir tests/auto-test-reports`)
+
+4. Parse & summarize (auto-detects the latest `test-reports*` folder under `tests/auto-test-reports`):
+```bash
+python tests/auto-test-reports/parse_junit_and_coverage.py
+```
+  Or point directly at a specific extracted folder if you prefer:
+```bash
+python tests/auto-test-reports/parse_junit_and_coverage.py tests/auto-test-reports/test-reports_<timestamp>
+```
+
+Output includes: junit totals, any failed tests with messages, top 10 slowest tests, overall coverage %, and top files by missed lines. The parser also copies the discovered artifacts into a timestamped `tests/auto-test-reports/test-reports_<UTC>` directory for a stable local snapshot.
+
 ## Running tests and summarizing locally
 
 When running tests locally you can reproduce the CI behavior and generate artifacts that this repository's helper script will collect into a timestamped folder under `tests/auto-test-reports`.
