@@ -30,14 +30,17 @@ jobs:
           python-version: '3.11'
 
       - name: Prepare report directory
+        id: prepare
         run: |
           # Ensure REPORT_DIR exists early so upload-artifact can find it even if the job is canceled
           REPORT_DIR=tests/auto-test-reports/test-reports_$(date -u +"%Y-%m-%dT%H-%M-%SZ")
           mkdir -p "$REPORT_DIR/reports"
-          # expose to later steps
+          # expose to later steps via GITHUB_ENV for shell access if needed
           echo "REPORT_DIR=$REPORT_DIR" >> $GITHUB_ENV
           # write a marker so upload can at least pick up something if tests are canceled
           echo "marker" > "$REPORT_DIR/UPLOAD_MARKER.txt"
+          # publish as a step output so later steps can reference it in expressions
+          echo "report_dir=$REPORT_DIR" >> $GITHUB_OUTPUT
 
       - name: Install dependencies
         run: |
@@ -46,6 +49,8 @@ jobs:
           pip install pytest pytest-cov
 
       - name: Run tests (pytest + coverage)
+        env:
+          REPORT_DIR: ${{ steps.prepare.outputs.report_dir }}
         run: |
           # Use REPORT_DIR prepared earlier
           mkdir -p "$REPORT_DIR/reports"
@@ -61,8 +66,10 @@ jobs:
 
       - name: Debug list artifact dir
         if: always()
+        env:
+          REPORT_DIR: ${{ steps.prepare.outputs.report_dir }}
         run: |
-          # REPORT_DIR is written to $GITHUB_ENV by the Prepare report directory step
+          # REPORT_DIR comes from the prepare step
           echo "REPORT_DIR=$REPORT_DIR"
           ls -la "$REPORT_DIR" || true
 
@@ -71,4 +78,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-reports
-          path: ${{ env.REPORT_DIR }}
+          path: ${{ steps.prepare.outputs.report_dir }}
