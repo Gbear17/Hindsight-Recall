@@ -15,11 +15,13 @@ contextBridge.exposeInMainWorld('hindsight', {
   validateAutostart: () => ipcRenderer.invoke('autostart:validate'),
   getPrefs: () => ipcRenderer.invoke('prefs:get'),
   setPrefs: (p) => ipcRenderer.invoke('prefs:set', p),
+  submitPassphrase: (p) => ipcRenderer.invoke('auth:submit', p),
   debugValidate: () => ipcRenderer.invoke('autostart:validate'),
   captureStart: () => ipcRenderer.invoke('capture:start'),
   captureStop: () => ipcRenderer.invoke('capture:stop'),
   captureStatus: () => ipcRenderer.invoke('capture:status'),
   killOtherCaptures: () => ipcRenderer.invoke('capture:kill-others'),
   purgeData: () => ipcRenderer.invoke('data:purge'),
+  changeSecret: (auth, next, useRecovery=false) => ipcRenderer.invoke('auth:change', {auth, next, useRecovery}),
   debugLog: (line) => ipcRenderer.invoke('debug:log', line)
 });

@@ -71,11 +71,84 @@ class CaptureService:
             self._capture_count = 0
 
     def _load_or_create_key(self) -> None:
+        # Support two modes: plain key file (legacy) or passphrase-wrapped key file
+        wrapped_file = self.key_file.with_suffix(self.key_file.suffix + '.pass')
+        # First, prefer wrapped key if present
+        if wrapped_file.exists():
+            ipc_path = self.key_file.with_suffix(self.key_file.suffix + '.ipc.json')
+            # Retry loop: IPC file & server race with Electron unlocking; wait a bit before giving up.
+            import socket, json, base64, time as _time
+            attempts = 0
+            last_error: Exception | None = None
+            while attempts < 8:  # ~ (0.25 + 0.5 + ... capped) < ~5s
+                try:
+                    if ipc_path.exists():
+                        info = json.loads(ipc_path.read_text(encoding='utf-8'))
+                        try:
+                            with socket.create_connection((info['host'], int(info['port'])), timeout=3) as s:
+                                req = json.dumps({'action': 'get_key', 'token': info['token']}) + '\n'
+                                s.sendall(req.encode('utf-8'))
+                                buf = b''
+                                while not buf.endswith(b'\n'):
+                                    chunk = s.recv(4096)
+                                    if not chunk:
+                                        break
+                                    buf += chunk
+                                resp = json.loads(buf.decode('utf-8').strip())
+                                if resp.get('status') == 'ok' and 'key_b64' in resp:
+                                    self._key = base64.b64decode(resp['key_b64'])
+                                    LOGGER.debug("Received unwrapped key via IPC from %s after %s attempt(s)", ipc_path, attempts+1)
+                                    return
+                                else:
+                                    last_error = RuntimeError(f"IPC unlock failed: {resp.get('msg')}")
+                                    LOGGER.debug("IPC attempt %s received error response: %s", attempts+1, resp.get('msg'))
+                        except Exception as exc:  # connection / decode error
+                            last_error = exc
+                            LOGGER.debug("IPC attempt %s exception: %s", attempts+1, exc)
+                    else:
+                        last_error = FileNotFoundError(f"IPC file not yet present: {ipc_path}")
+                        if attempts == 0:
+                            LOGGER.debug("IPC file %s not present on first attempt", ipc_path)
+                except Exception as exc:
+                    last_error = exc
+                    LOGGER.debug("IPC attempt %s outer exception: %s", attempts+1, exc)
+                attempts += 1
+                _time.sleep(min(0.25 * attempts, 0.9))
+            # Fallback: env var (legacy)
+            passphrase = os.environ.get('HINDSIGHT_PASSPHRASE')
+            if passphrase:
+                try:
+                    from .encryption import unwrap_key_with_passphrase
+                    payload = wrapped_file.read_bytes()
+                    self._key = unwrap_key_with_passphrase(payload, passphrase)
+                    LOGGER.debug("Unwrapped encryption key from %s using passphrase (IPC fallback)", wrapped_file)
+                    return
+                except Exception as exc:  # pragma: no cover
+                    last_error = exc
+            # If we reach here we failed all methods
+            msg = f"Failed to obtain unwrapped key after {attempts} IPC attempts: {last_error}" if last_error else 'Unknown key unwrap failure'
+            LOGGER.error(msg)
+            raise RuntimeError('Passphrase required but not provided (IPC not yet available)')
         if self.key_file.exists():
+            # Legacy unprotected key
             self._key = self.key_file.read_bytes().strip()
             LOGGER.debug("Loaded encryption key from %s", self.key_file)
+            return
+        # No key exists: create new data key. If a passphrase is present, store wrapped copy
+        self._key = generate_key()
+        passphrase = os.environ.get('HINDSIGHT_PASSPHRASE')
+        if passphrase:
+            try:
+                from .encryption import wrap_key_with_passphrase
+
+                payload = wrap_key_with_passphrase(self._key, passphrase)
+                wrapped_file.write_bytes(payload)
+                LOGGER.info("Generated new encryption key and wrapped to %s", wrapped_file)
+            except Exception:  # pragma: no cover - best effort
+                # Fallback to writing plaintext key if wrapping fails
+                self.key_file.write_bytes(self._key)
+                LOGGER.warning("Failed to wrap key; stored plaintext key at %s", self.key_file)
         else:
-            self._key = generate_key()
             self.key_file.write_bytes(self._key)
             LOGGER.info("Generated new encryption key at %s", self.key_file)
 
@@ -94,7 +167,18 @@ class CaptureService:
             LOGGER.info("Capture service stopped")
 
     def _run_loop(self) -> None:
+        # Use monotonic scheduling to reduce drift: schedule based on fixed next_target.
+        next_target = time.monotonic()
         while not self._stop.is_set():
+            now_m = time.monotonic()
+            # If we're early (can happen first iteration), realign.
+            if now_m < next_target:
+                # Wait the remaining time unless stop set.
+                remaining_pre = next_target - now_m
+                if remaining_pre > 0:
+                    self._stop.wait(remaining_pre)
+                if self._stop.is_set():
+                    break
             start = time.time()
             try:
                 if self._is_screen_locked():
@@ -159,10 +243,18 @@ class CaptureService:
                 }
                 self._last_status = err_status
                 self._write_status(err_status)
-            elapsed = time.time() - start
-            remaining = self.interval - elapsed
-            if remaining > 0:
-                self._stop.wait(remaining)
+            # Schedule next capture strictly by incrementing next_target by interval.
+            next_target += self.interval
+            # If we fell behind (e.g., long OCR/encrypt), catch up but avoid tight loop; skip missed periods.
+            behind = time.monotonic() - next_target
+            if behind > 0:
+                # Drop to current time baseline to prevent spiral of death if extremely behind.
+                skips = int(behind // self.interval)
+                if skips > 0:
+                    next_target += self.interval * skips
+            wait_duration = max(0.0, next_target - time.monotonic())
+            if wait_duration > 0:
+                self._stop.wait(wait_duration)
 
     def _capture_once(self) -> None:
         info = get_active_window()

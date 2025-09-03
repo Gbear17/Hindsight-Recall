@@ -31,20 +31,61 @@ hindsight_capture_wrapper.sh
 *.py[cod]
 *.pyo
 *.pyc
-*.pytest_cache/
+.pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.pytype/
+.hypothesis/
+.cache/
+
+# Coverage / test artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.cover
+*.py,cover
+tests/auto-test-reports/reports/
+tests/auto-test-reports/htmlcov/
+tests/auto-test-reports/*/reports/
+tests/auto-test-reports/*/htmlcov/
 
 # Node/Electron runtime
 node_modules/
 dist/
 out/
+build/
+release/
+*.asar
 
 # Virtual envs
 .venv/
 venv/
+.env
+.env.*
 
+# Python packaging metadata
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+wheelhouse/
+
+# Editor / IDE configs
+.vscode/
+.idea/
+*.code-workspace
 # Logs at root
 *.log
+
+# Generated lock / temp files
+poetry.lock
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+*.tmp
+*.bak
+*.orig
+*.rej
 
 # OS / editor
 .DS_Store

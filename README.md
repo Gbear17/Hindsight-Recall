@@ -5,11 +5,11 @@ Hindsight Recall is a personal memory archive that automatically captures, index
 ## Features
 
 ### Automatic Data Capture
-- Captures **screenshots of the active window only** every 5 seconds.
-- Filenames include window title, date, and time for easy association:
+- Captures **screenshots of the active window only** every 5 seconds (configurable).
+- **Timezone‑aware filenames**: window title + `YYYY-MM-DD_HH-MM-SS` using your selected timezone preference (`LOCAL`, `UTC`, or fixed offset like `+0530` / `-0800`). Optional DST toggle adds one hour and adjusts offset when enabled.
+  Example (timezone spec `-0500`, DST off):
   ```
-  WINDOW-TITLE_DATE-TIME.png
-  WINDOW-TITLE_DATE-TIME.txt
+  Editor_2025-09-02_14-30-05.png
   ```
 - Performs **OCR with Tesseract** on each screenshot.
 - Stores both screenshot and OCR text locally with encryption.
@@ -32,6 +32,76 @@ Hindsight Recall is a personal memory archive that automatically captures, index
 - **Mandatory end-to-end encryption** for all stored data (screenshots, OCR text, and indexes).
 - Strong recommendation to also run on **encrypted hard drives** for maximum security.
 - Configurable data retention window (30, 90, 180, or 365 days).
+
+#### Passphrase‑Protected Data Key (New)
+On first launch (or when enabling protection) you must create a **passphrase**. A random 32‑byte data key is generated and wrapped using a KEK derived from your passphrase (PBKDF2‑HMAC‑SHA256, 390k iterations, 16‑byte salt) and stored at `data/encrypted/key.fernet.pass`.
+
+The plaintext data key is never written unencrypted to disk. Unlocking is required before the Electron UI loads or any new captures can be read.
+
+#### Recovery Token (New)
+When the passphrase protection is created a one‑time **recovery token** is generated and shown in a modal. You must save it offline (password manager / paper). It is NOT re‑shown later. The recovery token lets you recover if the passphrase is forgotten (future flows may verify possession and allow re‑wrapping). Treat it like another secret; do not store it in the same place as the passphrase.
+
+#### Lockout & Destructive Reset (New)
+Incorrect passphrase attempts are tracked in `data/encrypted/lockstate.json` and also broadcast to the UI:
+1. After 1st failure: 5 minute lock
+2. After 2nd failure: 1 hour lock
+3. After 3rd failure: 24 hour lock
+4. Attempts continue accumulating. After a total of 12 failed attempts the application performs a **destructive reset**: the wrapped key and related IPC/ephemeral artifacts are deleted and keyring entries removed. Encrypted data becomes unrecoverable without the recovery token (future recovery flow) or backups.
+
+Lock countdown is shown in the passphrase modal; retries are disabled while locked.
+
+#### Autostart Behavior (Updated)
+If enabled, the background capture can start on login **without prompting** (using an autostart key stored in OS keyring) so historical data continues to accumulate. Opening the UI or tray still requires the passphrase. This strikes a balance between continuity and interactive security. Autostart also propagates your timezone preferences so the very first post‑login captures use correct local/offset timestamps in filenames.
+
+You can disable autostart in the Preferences if you prefer *no decryption until manual unlock*.
+
+#### Secure Unlock IPC (New)
+An ephemeral localhost TCP unlock server (127.0.0.1, random high port, random token) is created only during the unlock window to convey the unwrapped key to the capture process. Metadata is written to `data/encrypted/ipc_info.json` with `0600` permissions and removed/reset on destructive reset.
+
+#### Keyring Use
+The OS keyring stores:
+* Encrypted challenge token (for passphrase validation)
+* Autostart key (base64 of the data key) – used ONLY to allow capture to start at login
+* Recovery token (future recovery workflows)
+
+If your threat model includes an attacker with full user‑account access while unlocked, consider disabling autostart so the key is not retrievable without interaction.
+
+#### CLI Key Management (Developer / Advanced)
+The following commands operate relative to a base directory (default `data`). Passphrase is sent via stdin for create/validate:
+
+```
+python -m capture.keymgr --base-dir data --create --pass-stdin        # create protection (prints recovery token)
+python -m capture.keymgr --base-dir data --validate --pass-stdin      # validate passphrase
+python -m capture.keymgr --base-dir data --lock-info                  # show current lock state JSON
+python -m capture.keymgr --base-dir data --record-fail                # increment failure & show new lock state (used internally)
+python -m capture.keymgr --base-dir data --get-autostart              # print autostart key (if present)
+```
+
+#### Threat Model Notes
+| Threat | Mitigation | Residual Risk |
+| ------ | ---------- | ------------- |
+| Stolen powered‑off disk | Wrapped key + (recommended) full‑disk encryption | Brute force against passphrase (mitigated by KDF & complexity) |
+| Local malware running as user | Can keylog passphrase when entered | Use hardened OS, consider disabling autostart & periodic re‑lock |
+| Offline brute force | PBKDF2 390k iters slows attacks | Consider Argon2id upgrade for better GPU resistance |
+| Unauthorized local brute attempts | Lockout + destructive reset | Recovery token must be stored safely to avoid permanent loss |
+
+#### Future / Recommended Hardening
+These are not yet implemented but are straightforward enhancements:
+1. Switch PBKDF2 → Argon2id (memory‑hard) with calibrated params.
+2. Optional hardware secure storage (TPM / macOS Keychain secure enclave) for autostart key instead of generic keyring.
+3. Configurable lockout schedule & optional exponential backoff beyond current stages.
+4. Automatic periodic in‑memory rekeying / zeroization after inactivity (require re‑unlock to view captures while still allowing encrypted capture writes with cached key) — currently key remains resident for the process lifetime.
+5. Signed integrity metadata for `ipc_info.json` (HMAC with KEK‑derived subkey) to defend against local tampering/race.
+6. Single attempt per process invocation for unlock server; currently the server validates a single token but additional defense-in-depth could forcibly close after first success/failure.
+7. Explicit passphrase rotation command: generate new data key, re‑encrypt all existing artifacts in background (streaming), update wrapped key atomically.
+8. Optionally avoid storing the autostart key at all (strict mode) forcing manual unlock before any capture each boot.
+
+#### Operational Guidance
+* **Back up the recovery token** offline; if you lose both passphrase and token, data is unrecoverable.
+* Keep your system clock synchronized; lock timers rely on UTC timestamps.
+* Review `data/encrypted/lockstate.json` if unexpected lockouts occur.
+* Consider enabling full‑disk encryption; this project protects at application level, but unencrypted swap / hibernation images may leak memory contents.
+* Keep cryptography library updated to benefit from upstream security patches.
 
 ### Cross-Platform Support
 - Linux-first, but fully designed to support **Windows and macOS**.
@@ -128,6 +198,12 @@ Artifacts:
 - Plaintext (transient) screenshots + OCR: `data/plain/` (removed after each cycle)
 - Encrypted outputs: `data/encrypted/<original-filename>.png.enc` and `.txt.enc`
 
+Filename Timezone Rules:
+- Default (no preference saved yet): system local time.
+- Preference `logTimezone` = `UTC`: filenames use UTC clock.
+- Fixed offset preference (e.g. `+0200`): filenames use that wall clock (independent of host locality) and stay stable even if the system timezone changes.
+- `dstAdjust` preference: adds one hour and shifts offset (mirrors frontend log timestamping logic). Useful for manually toggling when using a fixed offset spec.
+
 Plaintext files are removed after encryption. Retention enforcement is not yet implemented.
 
 ### Running the Electron UI
@@ -154,6 +230,18 @@ Enable background autostart: use the UI checkbox "Run capture on login". This cr
   Removing (unchecking) deletes the respective file.
 
 Validate autostart: Click the "Validate Autostart" button to inspect the generated entry. The panel shows detected issues (missing file, malformed Exec line, etc.) or OK if healthy.
+
+### Environment Variables (Advanced)
+
+These are set automatically by the Electron supervisor when it spawns the Python capture process; you can also set them manually when running `python -m capture.cli` directly:
+
+| Variable | Purpose |
+| -------- | ------- |
+| `HINDSIGHT_TZ_SPEC` | Timezone spec for filename timestamps (`LOCAL`, `UTC`, or `+/-HHMM`). |
+| `HINDSIGHT_DST_ADJUST` | `1` to add one DST hour to the chosen spec (affects filename time). |
+| `HINDSIGHT_FORCE_BACKEND` | Force capture backend (`mss` or `imagegrab`). |
+| `HINDSIGHT_BACKEND_SWITCH_REASON` | Internal diagnostic tag when backend auto-switches. |
+| `HINDSIGHT_AUTOSTART` | Present (`1`) when launched from autostart wrapper. |
 
 ### Troubleshooting
 

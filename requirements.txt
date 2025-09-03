@@ -5,6 +5,7 @@ cryptography
 faiss-cpu
 torch
 transformers
+keyring
 
 # Tooling / style
 pytest

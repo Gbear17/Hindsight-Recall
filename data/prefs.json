@@ -2,5 +2,7 @@
   "autostart": true,
   "interval": 5,
   "delaySeconds": 10,
-  "backend": "mss"
+  "backend": "mss",
+  "logTimezone": "-0800",
+  "dstAdjust": true
 }

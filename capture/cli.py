@@ -43,13 +43,29 @@ def main(argv: list[str] | None = None) -> int:
         try:
             lock_path = base_dir / 'capture.lock'
             lock_path.parent.mkdir(parents=True, exist_ok=True)
-            lock_fp = lock_path.open('w')
-            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lock_fp.write(str(os.getpid()))
-            lock_fp.flush()
-        except BlockingIOError:
-            logging.getLogger("hindsight.capture").warning("Another capture instance appears to be running (lock busy); exiting")
-            return 2
+            # Open in read/write so we can read any previous PID then overwrite.
+            lock_fp = lock_path.open('a+')
+            try:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # Another process holds the lock; attempt to read its PID and report.
+                try:
+                    lock_fp.seek(0)
+                    other_pid_txt = lock_fp.read().strip()
+                except Exception:
+                    other_pid_txt = ''
+                logging.getLogger("hindsight.capture").warning(
+                    "Another capture instance already running (pid=%s); exiting", other_pid_txt or '?'
+                )
+                return 2
+            # We now hold the lock; write our PID (truncate first).
+            try:
+                lock_fp.seek(0)
+                lock_fp.truncate()
+                lock_fp.write(str(os.getpid()))
+                lock_fp.flush()
+            except Exception:  # pragma: no cover
+                pass
         except Exception as e:  # pragma: no cover
             logging.getLogger("hindsight.capture").warning("Lock setup failed: %s (continuing without strict single-instance)", e)
 
@@ -58,23 +74,29 @@ def main(argv: list[str] | None = None) -> int:
     if pid_path and pid_path.exists():
         try:
             existing_pid = int(pid_path.read_text().strip())
-            # If process alive, refuse to start to avoid dual writers.
             if existing_pid > 0:
                 try:
                     os.kill(existing_pid, 0)
                 except OSError:
-                    # Stale, remove and continue.
+                    # stale pid file
                     pid_path.unlink(missing_ok=True)  # type: ignore[arg-type]
                 else:
-                    logging.getLogger("hindsight.capture").warning("PID file %s already exists with live process %s; exiting", pid_path, existing_pid)
+                    logging.getLogger("hindsight.capture").warning(
+                        "Another capture instance already active (pid file %s pid=%s); exiting", pid_path, existing_pid
+                    )
                     return 3
         except Exception:  # pragma: no cover
-            pass
+            try:
+                pid_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+            except Exception:
+                pass
 
     service = build_default_service(base_dir, interval=args.interval)
     if pid_path:
         try:
-            pid_path.write_text(str(__import__('os').getpid()), encoding='utf-8')
+            tmp = pid_path.with_suffix('.tmp-' + str(os.getpid()))
+            tmp.write_text(str(os.getpid()), encoding='utf-8')
+            os.replace(tmp, pid_path)
         except Exception as e:  # pragma: no cover
             logging.getLogger("hindsight.capture").warning("Failed writing pid file %s: %s", pid_path, e)
     service.start()
