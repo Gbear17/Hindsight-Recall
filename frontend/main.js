@@ -110,9 +110,9 @@ function loadPrefs() {
   try {
     const raw = fs.readFileSync(PREFS_PATH, 'utf8');
     const parsed = JSON.parse(raw);
-  return Object.assign({autostart: false, interval: 5, delaySeconds: 0, backend: 'auto', logTimezone: 'LOCAL', dstAdjust: false}, parsed);
+    return Object.assign({autostart:false, interval:5, delaySeconds:0, backend:'auto', logTimezone:'LOCAL', dstAdjust:false, logLevel:'INFO'}, parsed);
   } catch {
-  return {autostart: false, interval: 5, delaySeconds: 0, backend: 'auto', logTimezone: 'LOCAL', dstAdjust: false};
+    return {autostart:false, interval:5, delaySeconds:0, backend:'auto', logTimezone:'LOCAL', dstAdjust:false, logLevel:'INFO'};
   }
 }
 function savePrefs(p) {
@@ -310,7 +310,7 @@ function startDetached(interval, opts={}) {
     }
   } catch(_) {}
   const py = getPythonCommand();
-  const args = [py, '-m', 'capture.cli', '--dir', path.join(projectRoot(),'data'), '--interval', String(interval||5), '--print-status', '--pid-file', PID_FILE];
+  const args = [py, '-m', 'capture.cli', '--dir', path.join(projectRoot(),'data'), '--interval', String(interval||5), '--print-status', '--pid-file', PID_FILE, '--log-level', String(prefs.logLevel||'INFO')];
   const env = {...process.env};
   if (prefs.backend && prefs.backend !== 'auto') {
     env.HINDSIGHT_FORCE_BACKEND = prefs.backend;
@@ -338,7 +338,8 @@ function startDetached(interval, opts={}) {
     fs.writeSync(errFd, `\n==== spawn ${new Date().toISOString()} interval=${interval||5} ====`);
     spawnInFlight = true;
     captureProc = spawn(args[0], args.slice(1), {detached: false, stdio:['ignore', outFd, errFd], cwd: projectRoot(), env});
-    broadcast('log:line', `[control] started capture (interval=${interval||5}s)`);
+    broadcast('log:line', `[control] started capture (interval=${interval||5}s level=${prefs.logLevel||'INFO'})`);
+    try { startPyLogTail(); } catch(_) {}
     captureProc.on('exit', (code, signal) => {
       spawnInFlight = false;
       const msg = `[anomaly] capture process exited early code=${code} signal=${signal || 'none'} pidFileExists=${!!readPid()}`;
@@ -805,14 +806,15 @@ ipcMain.handle('autostart:validate', () => validateAutostart());
 ipcMain.handle('prefs:get', () => ({...prefs}));
 ipcMain.handle('prefs:set', (_evt, newPrefs) => {
   const oldInterval = prefs.interval;
+  const oldLevel = prefs.logLevel;
   prefs = Object.assign(prefs, newPrefs || {});
+  if (!prefs.logLevel) prefs.logLevel = 'INFO';
   savePrefs(prefs);
-  try { broadcast('log:line', `[prefs] updated interval=${prefs.interval} delay=${prefs.delaySeconds} tz=${prefs.logTimezone} dst=${prefs.dstAdjust}`); } catch(_) {}
-  if (prefs.autostart) enableAutostart(true); // regenerate with new settings
-  if (prefs.interval !== oldInterval) {
-    // Restart detached service by signaling stop then start.
+  try { broadcast('log:line', `[prefs] updated interval=${prefs.interval} delay=${prefs.delaySeconds} tz=${prefs.logTimezone} dst=${prefs.dstAdjust} level=${prefs.logLevel}`); } catch(_) {}
+  if (prefs.autostart) enableAutostart(true);
+  if (prefs.interval !== oldInterval || prefs.logLevel !== oldLevel) {
     stopDetached();
-    setTimeout(()=>startDetached(prefs.interval || 5), 500);
+    setTimeout(()=>startDetached(prefs.interval||5), 500);
   }
   return {...prefs};
 });
@@ -949,7 +951,7 @@ app.whenReady().then(() => {
       // Check lock state before prompting
       try {
         const py = getPythonCommand();
-        const li = require('child_process').spawnSync(py, ['-m','capture.keymgr','--base-dir', path.join(projectRoot(),'data'),'--lock-info'], {encoding:'utf8', cwd: projectRoot()});
+        const li = require('child_process').spawnSync(py, ['-m','capture.keymgr','--base-dir', path.join(projectRoot(), 'data'),'--lock-info'], {encoding:'utf8', cwd: projectRoot()});
         if (!li.error && li.status === 0 && li.stdout) {
           try {
             const info = JSON.parse(li.stdout);
@@ -1322,3 +1324,44 @@ app.on('before-quit', () => {
   } catch(_) {}
   try { stopDetached(); } catch(_) {}
 });
+
+// ---- Python log tail broadcasting ----
+let _pyLogTail = false;
+let _pyLogPos = {};
+function startPyLogTail() {
+  if (_pyLogTail) return; _pyLogTail = true;
+  const logDir = path.join(projectRoot(),'data');
+  const files = ['capture.stdout.log','capture.stderr.log'];
+  for (const f of files) {
+    const full = path.join(logDir,f);
+    try { if (!fs.existsSync(full)) fs.writeFileSync(full,''); _pyLogPos[full] = fs.statSync(full).size; } catch(_) {}
+  }
+  function poll() {
+    for (const f of files) {
+      const full = path.join(logDir,f);
+      try {
+        const st = fs.statSync(full);
+        const prev = _pyLogPos[full]||0;
+        if (st.size > prev) {
+          const fd = fs.openSync(full,'r');
+          const len = st.size - prev;
+          const buf = Buffer.alloc(len);
+          fs.readSync(fd, buf, 0, len, prev);
+            fs.closeSync(fd);
+          _pyLogPos[full] = st.size;
+          const text = buf.toString('utf8');
+          const lines = text.split(/\r?\n/).filter(l=>l.trim().length);
+          for (const line of lines) {
+            let level = 'INFO';
+            const m = line.match(/\] (DEBUG|INFO|WARNING|ERROR|CRITICAL) /);
+            if (m) level = m[1];
+            const payload = {file:f, level, line};
+            for (const w of BrowserWindow.getAllWindows()) { try { w.webContents.send('pylog:line', payload); } catch(_) {} }
+          }
+        }
+      } catch(_) {}
+    }
+    setTimeout(poll, 1200);
+  }
+  poll();
+}

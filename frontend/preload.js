@@ -6,10 +6,12 @@ const emitter = new EventEmitter();
 
 ipcRenderer.on('status:update', (_e, payload) => emitter.emit('status', payload));
 ipcRenderer.on('log:line', (_e, line) => emitter.emit('log', line));
+ipcRenderer.on('pylog:line', (_e, payload) => emitter.emit('pylog', payload));
 
 contextBridge.exposeInMainWorld('hindsight', {
   onStatus: (cb) => { emitter.on('status', cb); },
   onLog: (cb) => { emitter.on('log', cb); },
+  onPyLog: (cb) => { emitter.on('pylog', cb); },
   getAutostart: () => ipcRenderer.invoke('autostart:get'),
   setAutostart: (enable) => ipcRenderer.invoke('autostart:set', enable),
   validateAutostart: () => ipcRenderer.invoke('autostart:validate'),
