@@ -3,11 +3,11 @@ Priority,Title,Description,Status,LastUpdated
 1.2,Migrate PBKDF2 to Argon2id,"Adopt Argon2id (memory-hard) with parameter calibration; seamless in-place rewrap on first unlock.",Planned,2025-09-01
 1.3,Single-Use Unlock Server,"Restrict unlock IPC server to exactly one connection (success or fail) then self-destruct to reduce attack window.",Planned,2025-09-01
 1.4,Secret Memory Hygiene,"Use mutable bytearrays + in-place zeroization for passphrase and unwrapped key; avoid lingering immutable copies.",Planned,2025-09-01
-1.5,Recovery Flow Implementation,"Add --recover <token> to re-wrap key with new passphrase, rotate challenge, and optionally issue new token.",Planned,2025-09-01
+1.5,Recovery Flow Implementation,"Add --recover <token> to re-wrap key with new passphrase, rotate challenge, and optionally issue new token.",Done,2025-09-03
 1.6,Rate Limiting Between Attempts,"Enforce minimum delay (e.g. 750ms + jitter) on failed passphrase attempts outside lock periods.",Planned,2025-09-01
 1.7,Passphrase Strength Meter,"Frontend entropy feedback (zxcvbn or heuristic) and transparent policy; encourage longer diceware-style phrases.",Planned,2025-09-01
 1.8,Inactivity Relock,"Purge in-memory key after configurable idle time; require passphrase again while optionally pausing capture.",Planned,2025-09-01
-1.9,Key Rotation Tooling,"Background streaming re-encryption with journaled two-phase commit; schedule or manual trigger.",Planned,2025-09-01
+1.9,Key Rotation Tooling,"Background streaming re-encryption with journaled two-phase commit; schedule or manual trigger.",Partial,2025-09-03
 1.10,Integrity HMAC for IPC Metadata,"Add HMAC (HKDF-subkey) over ipc_info.json to detect tampering of port/token before use.",Planned,2025-09-01
 1.11,Autostart Strict Mode,"Optional mode disabling autostart key; capture cannot start until interactive unlock each session.",Planned,2025-09-01
 1.12,Append-Only Audit Log,"Write tamper-evident (HMAC-chained) JSONL entries for unlock attempts, lockouts, resets.",Planned,2025-09-01
