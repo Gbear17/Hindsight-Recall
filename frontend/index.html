@@ -9,6 +9,8 @@
   <div id="pageMain">
   <section>
   <h2>Capture Status</h2>
+  <!-- Quick preferences removed; use Preferences page -->
+  <!-- Validation moved to Preferences page -->
   <div id="status">Waiting for first capture...</div>
   <div id="backendInfo" style="margin-top:4px;font-size:12px;color:#333;display:none;"></div>
   <div id="staleWarning" style="display:none;color:#b00;font-weight:bold;margin-top:4px;">Status stale: no recent capture activity.</div>
@@ -20,24 +22,7 @@
       <span id="pidDisplay" style="font-size:12px;color:#444;"></span>
       <span id="errorDisplay" style="font-size:12px;color:#b00;font-weight:bold;"></span>
     </div>
-    <pre id="raw" style="background:#111;color:#9f9;padding:8px;max-height:200px;overflow:auto;"></pre>
-  </section>
-  <section style="margin-top:18px;">
-    <h2>Python Logs <span style="font-size:12px;font-weight:normal;">(live)</span></h2>
-    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:4px;">
-      <label style="font-size:12px;">Min Level
-        <select id="pyLogFilter" style="margin-left:4px;">
-          <option value="DEBUG">DEBUG</option>
-          <option value="INFO" selected>INFO</option>
-          <option value="WARNING">WARNING</option>
-          <option value="ERROR">ERROR</option>
-          <option value="CRITICAL">CRITICAL</option>
-        </select>
-      </label>
-      <button id="pyLogClear" style="font-size:12px;">Clear</button>
-      <span id="pyLogStats" style="font-size:11px;color:#555;"></span>
-    </div>
-    <pre id="pyLogView" style="background:#000;color:#eee;padding:8px;max-height:260px;overflow:auto;font-size:12px;line-height:1.3;border:1px solid #333;"></pre>
+    <pre id="raw" style="background:#111;color:#9f9;padding:8px;max-height:300px;overflow:auto;"></pre>
   </section>
   </div>
   <div id="pagePrefs" style="display:none;max-width:640px;">
@@ -69,15 +54,6 @@
           <option value="+0000">+0000</option>
         </select>
       </label>
-      <label style="display:block;margin:4px 0;">Python Log Level
-        <select id="pLogLevel" style="width:140px;">
-          <option value="DEBUG">DEBUG</option>
-          <option value="INFO" selected>INFO</option>
-          <option value="WARNING">WARNING</option>
-          <option value="ERROR">ERROR</option>
-          <option value="CRITICAL">CRITICAL</option>
-        </select>
-      </label>
       <label style="display:block;margin:4px 0;">
         <input type="checkbox" id="pDstAdjust" /> Add 1 hour daylight saving adjustment
       </label>
@@ -107,33 +83,121 @@
   </div>
   <script>
     (function init() {
-      if (!window.hindsight) { return setTimeout(init, 100); }
+      if (!window.hindsight) {
+        // Retry shortly until preload exposes API
+        return setTimeout(init, 100);
+      }
       const raw = document.getElementById('raw');
       raw.textContent += '\n[ui] Hindsight API ready';
       function initAutostartCheckbox() {
-        const cb = document.getElementById('autostartToggle'); if (!cb) return;
+        const cb = document.getElementById('autostartToggle');
+        if (!cb) return;
         window.hindsight.getAutostart().then(enabled => { cb.checked = !!enabled; }).catch(e=>{raw.textContent += '\n[ui] autostart get failed: '+e;});
         cb.addEventListener('change', (e) => {
           window.hindsight.setAutostart(e.target.checked).then(() => { if (e.target.checked) doValidate(); }).catch(err=>{raw.textContent += '\n[ui] setAutostart error: '+err;});
         });
       }
+
+      // Load prefs (main page minimal subset)
       window.hindsight.getPrefs().then(p => {
+        const qi = document.getElementById('intervalInput');
+        const qd = document.getElementById('delayInput');
+        if (qi) qi.value = p.interval || 5;
+        if (qd) qd.value = p.delaySeconds || 0;
+        // Prefs modal fields
         const pInt = document.getElementById('pInterval');
         const pDel = document.getElementById('pDelay');
         const pTz = document.getElementById('pLogTz');
-        const pLevel = document.getElementById('pLogLevel');
         if (pInt) pInt.value = p.interval || 5;
         if (pDel) pDel.value = p.delaySeconds || 0;
-        if (pTz) {
+  if (pTz) {
+          // If custom offset not in list, add temporarily
           if (p.logTimezone && !Array.from(pTz.options).some(o=>o.value===p.logTimezone)) {
             const opt = document.createElement('option'); opt.value = p.logTimezone; opt.textContent = p.logTimezone + ' (custom)'; pTz.appendChild(opt);
           }
           pTz.value = p.logTimezone || 'LOCAL';
         }
-        if (pLevel && p.logLevel) { try { pLevel.value = p.logLevel; } catch(_) {} }
-        const dstCb = document.getElementById('pDstAdjust'); if (dstCb) dstCb.checked = !!p.dstAdjust;
+  const dstCb = document.getElementById('pDstAdjust'); if (dstCb) dstCb.checked = !!p.dstAdjust;
         initAutostartCheckbox();
       }).catch(e=>{raw.textContent += '\n[ui] prefs get failed: '+e;});
+      // Populate common time zones (fixed offsets / notable)
+      (function populateTimezones(){
+        const tzSelect = document.getElementById('pLogTz');
+        if (!tzSelect) return;
+        // Preserve currently assigned value (from persisted prefs) before rebuilding list.
+        const previous = tzSelect.value || null;
+        const common = [
+          ['LOCAL','LOCAL (system)'],
+          ['UTC','UTC (+0000)'],
+          ['-1100','-1100 (Pacific Midway)'],
+          ['-1000','-1000 (Hawaii)'],
+          ['-0900','-0900 (Alaska)'],
+          ['-0800','-0800 (US Pacific)'],
+          ['-0700','-0700 (US Mountain)'],
+          ['-0600','-0600 (US Central)'],
+          ['-0500','-0500 (US Eastern)'],
+          ['-0400','-0400 (Atlantic / Carib)'],
+          ['-0300','-0300 (Argentina / Brazil NE)'],
+          ['-0200','-0200 (South Georgia)'],
+            ['-0100','-0100 (Azores)'],
+            ['+0000','+0000 (UTC duplicate)'],
+            ['+0100','+0100 (Central Europe)'],
+            ['+0200','+0200 (Eastern Europe / S. Africa)'],
+            ['+0300','+0300 (Moscow / East Africa)'],
+            ['+0330','+0330 (Iran)'],
+            ['+0400','+0400 (Gulf)'],
+            ['+0430','+0430 (Afghanistan)'],
+            ['+0500','+0500 (Pakistan)'],
+            ['+0530','+0530 (India)'],
+            ['+0545','+0545 (Nepal)'],
+            ['+0600','+0600 (Bangladesh)'],
+            ['+0630','+0630 (Myanmar)'],
+            ['+0700','+0700 (Indochina / WIB)'],
+            ['+0800','+0800 (China / Singapore)'],
+            ['+0830','+0830 (North Korea)'],
+            ['+0900','+0900 (Japan / Korea)'],
+            ['+0930','+0930 (Central Australia)'],
+            ['+1000','+1000 (Eastern Australia)'],
+            ['+1030','+1030 (Australia CDT alt)'],
+            ['+1100','+1100 (Norfolk / Solomon)'],
+            ['+1200','+1200 (NZ standard)'],
+            ['+1245','+1245 (Chatham Islands)'],
+            ['+1300','+1300 (NZ daylight / Tonga)'],
+            ['+1400','+1400 (Line Islands)']
+        ];
+        // Clear and repopulate (always rebuild full known list)
+        while (tzSelect.options.length) tzSelect.remove(0);
+        for (const [val,label] of common) {
+          const opt = document.createElement('option');
+          opt.value = val; opt.textContent = label; tzSelect.appendChild(opt);
+        }
+        // If previous (persisted) value was a custom offset and not in common, re-add it.
+        if (previous && !Array.from(tzSelect.options).some(o=>o.value === previous)) {
+          const opt = document.createElement('option');
+          opt.value = previous; opt.textContent = previous + ' (custom)';
+          tzSelect.appendChild(opt);
+        }
+        if (previous) {
+          try { tzSelect.value = previous; } catch(_) {}
+        }
+      })();
+
+      // Preferences page navigation
+      const pageMain = document.getElementById('pageMain');
+      const pagePrefs = document.getElementById('pagePrefs');
+      document.getElementById('openPrefs').addEventListener('click', ()=>{
+        pageMain.style.display='none';
+        pagePrefs.style.display='block';
+      });
+      document.getElementById('closePrefs').addEventListener('click', ()=>{
+        pagePrefs.style.display='none';
+        pageMain.style.display='block';
+      });
+      // Save all prefs from dedicated page
+      // Live timezone validation
+      const tzSel = document.getElementById('pLogTz');
+      const saveBtn = document.getElementById('saveAllPrefs');
+      const saveMsg = document.getElementById('saveAllMsg');
       function validateTz(value) {
         const v = (value||'').trim().toUpperCase();
         if (v === 'LOCAL' || v === 'UTC') return {ok:true, norm:v};
@@ -141,61 +205,220 @@
         if (/^[+-]\d{2}:\d{2}$/.test(v)) return {ok:true, norm:v.replace(':','')};
         return {ok:false, norm:null};
       }
-      const tzSel = document.getElementById('pLogTz');
-      const saveBtn = document.getElementById('saveAllPrefs');
-      const saveMsg = document.getElementById('saveAllMsg');
       function applyTzValidation() {
         const {ok, norm} = validateTz(tzSel.value);
-        if (!ok) { tzSel.style.borderColor='#c00'; saveBtn.disabled=true; saveMsg.textContent='Invalid timezone.'; saveMsg.style.color='#c00'; }
-        else { tzSel.style.borderColor=''; saveBtn.disabled=false; saveMsg.textContent=''; saveMsg.style.color='#444'; if (norm && norm!==tzSel.value) tzSel.value=norm; }
+        if (!ok) {
+          tzSel.style.borderColor = '#c00';
+          saveBtn.disabled = true;
+          saveMsg.textContent = 'Invalid timezone. Use LOCAL, UTC, or +HHMM/-HHMM.';
+          saveMsg.style.color = '#c00';
+        } else {
+          tzSel.style.borderColor = '';
+          saveBtn.disabled = false;
+          saveMsg.textContent = '';
+          saveMsg.style.color = '#444';
+          // If user typed with colon and it's valid, update control to normalized form (without losing focus)
+          if (norm && norm !== tzSel.value) tzSel.value = norm;
+        }
       }
-      tzSel.addEventListener('input', applyTzValidation); tzSel.addEventListener('change', applyTzValidation); applyTzValidation();
+      tzSel.addEventListener('input', applyTzValidation);
+      tzSel.addEventListener('change', applyTzValidation);
+      applyTzValidation();
+
       document.getElementById('saveAllPrefs').addEventListener('click', ()=>{
         const interval = parseInt(document.getElementById('pInterval').value,10) || 5;
         const delaySeconds = parseInt(document.getElementById('pDelay').value,10) || 0;
-        const tzRaw = tzSel.value; const {ok, norm} = validateTz(tzRaw); if (!ok) { applyTzValidation(); return; }
-        const logTimezone = norm; const dstAdjust = !!document.getElementById('pDstAdjust').checked;
-        const logLevelSel = document.getElementById('pLogLevel'); const logLevel = logLevelSel ? logLevelSel.value : 'INFO';
-        const msgEl = saveMsg; msgEl.textContent='Saving...'; msgEl.style.color='#444';
-        window.hindsight.setPrefs({interval, delaySeconds, logTimezone, dstAdjust, logLevel}).then(()=>{ msgEl.textContent='Saved.'; }).catch(err=>{ msgEl.textContent='Error: '+err; msgEl.style.color='#c00'; });
+        const tzRaw = tzSel.value;
+        const {ok, norm} = validateTz(tzRaw);
+        if (!ok) { applyTzValidation(); return; }
+        const logTimezone = norm;
+        const msgEl = saveMsg;
+        msgEl.textContent = 'Saving...'; msgEl.style.color = '#444';
+  const dstAdjust = !!document.getElementById('pDstAdjust').checked;
+        window.hindsight.setPrefs({interval, delaySeconds, logTimezone, dstAdjust}).then(p => {
+          msgEl.textContent = 'Saved.';
+          // Reflect into main page quick prefs if legacy inputs still exist (older layout compatibility)
+          const qi = document.getElementById('intervalInput');
+          const qd = document.getElementById('delayInput');
+          if (qi) qi.value = p.interval || interval;
+          if (qd) qd.value = p.delaySeconds || delaySeconds;
+        }).catch(err => { msgEl.textContent = 'Error: ' + err; msgEl.style.color = '#c00'; });
       });
-      // Status updates
-      let lastStatusTime = null; let lastIntervalSeconds = 5; window.hindsight.getPrefs().then(p=>{ if (p && p.interval) lastIntervalSeconds = p.interval; }).catch(()=>{});
-      let lastBackend = null; let lastSwitchReason = null; let lastSwitchLocalTs = null;
-      window.hindsight.onStatus((s)=>{
-        lastStatusTime = Date.now(); if (s.interval) lastIntervalSeconds = s.interval;
-        const statusEl = document.getElementById('status'); let localStr = s.last_capture_utc; try { localStr = new Date(s.last_capture_utc).toLocaleString(); } catch(_) {}
+
+      const savePrefsBtn = document.getElementById('savePrefsBtn');
+      if (savePrefsBtn) {
+        savePrefsBtn.addEventListener('click', () => {
+          const interval = parseInt(document.getElementById('intervalInput').value, 10) || 5;
+          const delaySeconds = parseInt(document.getElementById('delayInput').value, 10) || 0;
+          const msgEl = document.getElementById('prefsMsg');
+          if (msgEl) msgEl.textContent = 'Saving...';
+          window.hindsight.setPrefs({interval, delaySeconds}).then(p => {
+            if (msgEl) msgEl.textContent = 'Saved.';
+            if (p.autostart) setTimeout(doValidate, 250);
+          }).catch(err => { if (msgEl) msgEl.textContent = 'Error: ' + err; });
+        });
+      }
+
+      function doValidate() {
+        const wrap = document.getElementById('validation');
+        const body = document.getElementById('validationBody');
+        wrap.style.display = 'block';
+        body.textContent = 'Validating...';
+        window.hindsight.validateAutostart().then(res => {
+      console.log('[validate] result', res);
+          if (!res.exists) {
+            body.textContent = 'Autostart file not found. (Enable autostart to generate)';
+            if (document.getElementById('autostartToggle').checked) {
+              setTimeout(() => {
+        window.hindsight.validateAutostart().then(r2 => { console.log('[validate] retry', r2); if (r2.exists) doValidate(); }).catch(()=>{});
+              }, 400);
+            }
+            return;
+          }
+            let out = 'File: ' + res.file + '\n';
+            if (res.exec) out += 'Exec: ' + res.exec + '\n';
+            if (!res.issues || res.issues.length === 0) out += '\nStatus: OK';
+            else out += '\nIssues:\n - ' + res.issues.join('\n - ');
+            body.textContent = out;
+        }).catch(err => {
+          console.error('[validate] error', err);
+          body.textContent = 'Validation error: ' + (err && err.message ? err.message : err);
+        });
+      }
+      window.doValidate = doValidate; // expose for console debugging
+      const valBtn = document.getElementById('validateBtn');
+      if (valBtn) {
+        valBtn.addEventListener('click', doValidate);
+        setTimeout(()=>{ if (document.getElementById('autostartToggle')?.checked) doValidate(); }, 600);
+      }
+
+      let lastStatusTime = null;
+      let lastIntervalSeconds = 5; // default, updated from prefs
+      window.hindsight.getPrefs().then(p=>{ if (p && p.interval) lastIntervalSeconds = p.interval; }).catch(()=>{});
+      let lastBackend = null;
+      let lastSwitchReason = null;
+      let lastSwitchLocalTs = null;
+      window.hindsight.onStatus((s) => {
+        lastStatusTime = Date.now();
+        if (s.interval) lastIntervalSeconds = s.interval; // if backend includes
+        const statusEl = document.getElementById('status');
+        let localStr = s.last_capture_utc;
+        try { localStr = new Date(s.last_capture_utc).toLocaleString(); } catch(_) {}
         statusEl.textContent = `Last capture (local): ${localStr} | Window: ${s.window_title} | Count: ${s.capture_count}`;
-        document.getElementById('raw').textContent = JSON.stringify(s,null,2);
-        const errEl = document.getElementById('errorDisplay'); errEl.textContent = s.error ? ('Error: '+s.error) : '';
-        const backendInfoEl = document.getElementById('backendInfo'); if (s.capture_backend || s.backend_switch_reason || lastSwitchReason) {
-          backendInfoEl.style.display='block'; if (s.backend_switch_reason) { lastSwitchReason = s.backend_switch_reason; lastSwitchLocalTs = Date.now(); }
-          const parts=[]; if (s.capture_backend) parts.push('Backend: '+s.capture_backend); if (lastSwitchReason) { let when=''; if (lastSwitchLocalTs) when=' at '+new Date(lastSwitchLocalTs).toLocaleTimeString(); parts.push('Last switch reason: '+lastSwitchReason+when); }
+        document.getElementById('raw').textContent = JSON.stringify(s, null, 2);
+        const warn = document.getElementById('staleWarning');
+        warn.style.display = 'none';
+        const errEl = document.getElementById('errorDisplay');
+        if (s.error) {
+          errEl.textContent = 'Error: ' + s.error;
+        } else {
+          errEl.textContent = '';
+        }
+        // Backend / switch reason surfacing
+        const backendInfoEl = document.getElementById('backendInfo');
+        let changed = false;
+        if (s.capture_backend && s.capture_backend !== lastBackend) {
+          changed = true;
+        }
+        if (s.backend_switch_reason) {
+          lastSwitchReason = s.backend_switch_reason;
+          lastSwitchLocalTs = Date.now();
+        }
+        if (s.capture_backend || lastSwitchReason) {
+          backendInfoEl.style.display = 'block';
+          const parts = [];
+          if (s.capture_backend) parts.push('Backend: ' + s.capture_backend);
+          if (lastSwitchReason) {
+            let when = '';
+            if (lastSwitchLocalTs) when = ' at ' + new Date(lastSwitchLocalTs).toLocaleTimeString();
+            parts.push('Last switch reason: ' + lastSwitchReason + when);
+          }
           backendInfoEl.textContent = parts.join(' | ');
         }
         if (s.capture_backend) lastBackend = s.capture_backend;
       });
-      window.hindsight.onLog((msg)=>{ const raw = document.getElementById('raw'); raw.textContent += "\n[log] "+msg; });
-      // Python log streaming
-      (function pyLogInit(){
-        const view = document.getElementById('pyLogView'); const sel = document.getElementById('pyLogFilter'); const clearBtn = document.getElementById('pyLogClear'); const stats = document.getElementById('pyLogStats');
-        const order = {DEBUG:0, INFO:1, WARNING:2, ERROR:3, CRITICAL:4}; let counts={DEBUG:0,INFO:0,WARNING:0,ERROR:0,CRITICAL:0};
-        function update(){ stats.textContent = `Shown≥${sel.value} D:${counts.DEBUG} I:${counts.INFO} W:${counts.WARNING} E:${counts.ERROR} C:${counts.CRITICAL}`; }
-        clearBtn.addEventListener('click', ()=>{ view.textContent=''; counts={DEBUG:0,INFO:0,WARNING:0,ERROR:0,CRITICAL:0}; update(); });
-        window.hindsight.onPyLog(pl=>{ if (!pl||!pl.line) return; const lvl=pl.level||'INFO'; counts[lvl]=(counts[lvl]||0)+1; if (order[lvl] >= order[sel.value]) { const line=pl.line.replace(/\x1b\[[0-9;]*m/g,''); view.textContent += (view.textContent?'\n':'')+line; if (view.scrollTop+view.clientHeight+40 >= view.scrollHeight) view.scrollTop=view.scrollHeight; } update(); });
-        sel.addEventListener('change', ()=>{ /* future: rebuild if we keep ring buffer */ update(); }); update();
-      })();
+      window.hindsight.onLog((msg) => {
+        const raw = document.getElementById('raw');
+        raw.textContent += "\n[log] " + msg;
+      });
+      // Staleness checker: warn if no status within 3 * interval (min 10s grace)
+      function checkStale() {
+        const warn = document.getElementById('staleWarning');
+        const now = Date.now();
+        const thresholdMs = Math.max(10000, (lastIntervalSeconds||5) * 3000); // 3*interval*1000
+        if (!lastStatusTime) {
+          // After initial grace period, show warning if still nothing
+          if (now > thresholdMs + performance.timing.navigationStart) {
+            warn.textContent = 'Status stale: no capture data received yet.';
+            warn.style.display = 'block';
+          }
+        } else if ((now - lastStatusTime) > thresholdMs) {
+          const age = ((now - lastStatusTime)/1000).toFixed(1);
+            warn.textContent = `Status stale: last update ${age}s ago (threshold ${(thresholdMs/1000).toFixed(0)}s).`;
+            warn.style.display = 'block';
+        } else {
+          warn.style.display = 'none';
+        }
+        setTimeout(checkStale, 4000);
+      }
+      setTimeout(checkStale, 6000);
       // Buttons
-      document.getElementById('btnStart').addEventListener('click', ()=>{ window.hindsight.captureStart(); setTimeout(refreshPid,700); });
-      document.getElementById('btnStop').addEventListener('click', ()=>{ window.hindsight.captureStop().then(()=>setTimeout(refreshPid,700)); });
+      document.getElementById('btnStart').addEventListener('click', ()=>{
+        const btn = document.getElementById('btnStart');
+        if (btn.dataset.lock === '1') return; // debounce
+        btn.dataset.lock = '1';
+        btn.disabled = true;
+        window.hindsight.captureStart().then(r=>{ 
+          document.getElementById('pidDisplay').textContent = (r && r.action==='already') ? 'Already running' : 'Starting...';
+          setTimeout(refreshPid,700);
+        }).finally(()=>{
+          setTimeout(()=>{ btn.dataset.lock=''; btn.disabled=false; }, 1500);
+        });
+      });
+      document.getElementById('btnStop').addEventListener('click', ()=>{
+        window.hindsight.captureStop().then(()=>{ setTimeout(refreshPid,700);});
+      });
       document.getElementById('btnPid').addEventListener('click', refreshPid);
-      document.getElementById('btnPurge').addEventListener('click', ()=>{ if (!confirm('Delete all stored capture data?')) return; window.hindsight.purgeData().then(r=>{ raw.textContent+='\n[ui] Purge removed '+(r.removed||0)+' items'; setTimeout(refreshPid,500); }).catch(e=>{ raw.textContent+='\n[ui] Purge error: '+e; }); });
-      function refreshPid(){ window.hindsight.captureStatus().then(r=>{ document.getElementById('pidDisplay').textContent = r.pid ? ('PID: '+r.pid) : 'Not running'; }); }
-      setInterval(refreshPid, 5000); refreshPid();
-      document.getElementById('openPrefs').addEventListener('click', ()=>{ document.getElementById('pageMain').style.display='none'; document.getElementById('pagePrefs').style.display='block'; });
-      document.getElementById('closePrefs').addEventListener('click', ()=>{ document.getElementById('pagePrefs').style.display='none'; document.getElementById('pageMain').style.display='block'; });
-      function doValidate(){ const wrap=document.getElementById('validation'); const body=document.getElementById('validationBody'); wrap.style.display='block'; body.textContent='Validating...'; window.hindsight.validateAutostart().then(res=>{ if(!res.exists){ body.textContent='Autostart file not found.'; return;} let out='File: '+res.file+'\n'; if(res.exec) out+='Exec: '+res.exec+'\n'; if(!res.issues||!res.issues.length) out+='\nStatus: OK'; else out+='\nIssues:\n - '+res.issues.join('\n - '); body.textContent=out; }).catch(err=>{ body.textContent='Validation error: '+err; }); }
-      document.getElementById('validateBtn').addEventListener('click', doValidate);
+      document.getElementById('btnPurge').addEventListener('click', ()=>{
+        if (!confirm('Delete all stored capture data (encrypted + plaintext artifacts)?')) return;
+        window.hindsight.purgeData().then(r=>{
+          raw.textContent += '\n[ui] Purge removed '+(r.removed||0)+' items';
+          setTimeout(refreshPid, 500);
+        }).catch(e=>{ raw.textContent += '\n[ui] Purge error: '+e; });
+      });
+      function refreshPid(){
+        window.hindsight.captureStatus().then(r=>{
+          document.getElementById('pidDisplay').textContent = r.pid ? ('PID: '+r.pid) : 'Not running';
+        });
+      }
+      setInterval(refreshPid, 5000);
+      refreshPid();
+
+      // Change secret logic
+      const secBtn = document.getElementById('secChangeBtn');
+      const secMsg = document.getElementById('secMsg');
+      function isPin(val){ return /^\d{4,8}$/.test(val); }
+      function passOk(val){ return val.length>=12 && /[A-Z]/.test(val) && /[a-z]/.test(val) && /\d/.test(val) && /[^A-Za-z0-9\s]/.test(val) && !/\s/.test(val); }
+      secBtn.addEventListener('click', ()=>{
+        const cur = document.getElementById('secCurrent').value.trim();
+        const n1 = document.getElementById('secNew').value;
+        const n2 = document.getElementById('secNew2').value;
+        const useRec = document.getElementById('secUseRecovery').checked;
+        secMsg.style.color = '#444';
+        if (!cur || !n1 || !n2) { secMsg.textContent='Fill all fields'; secMsg.style.color='#c00'; return; }
+        if (n1 !== n2) { secMsg.textContent='New secrets mismatch'; secMsg.style.color='#c00'; return; }
+        if (!(isPin(n1) || passOk(n1))) { secMsg.textContent='New secret fails complexity'; secMsg.style.color='#c00'; return; }
+        secMsg.textContent='Changing...';
+        window.hindsight.changeSecret(cur, n1, useRec).then(r=>{
+          if (r && r.ok) {
+            secMsg.textContent='Changed.'; secMsg.style.color='#080';
+            document.getElementById('secNew').value='';
+            document.getElementById('secNew2').value='';
+          } else {
+            secMsg.textContent='Error: '+ (r && (r.err||r.code) || 'unknown'); secMsg.style.color='#c00';
+          }
+        }).catch(e=>{ secMsg.textContent='Error: '+e; secMsg.style.color='#c00'; });
+      });
     })();
   </script>
 </body>
