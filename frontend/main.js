@@ -1,107 +1,108 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 // Entry point for Electron frontend
 const {app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, powerMonitor} = require('electron');
-let tray = null;
-// Capture key availability (data key accessible for service restarts)
-let unlockedSuccessfully = false; // capture-level unlock (raw key or passphrase-derived)
-// UI unlock (user has actually provided passphrase this session). Autostart raw key path does NOT set this.
-let unlockedUI = false;
-// Expose passphrase prompt function & needPass flag to tray handlers after initialization.
-let _promptAndValidateBlocking = null;
-let _needPassGlobal = false;
-
-// ---- Single Instance Enforcement ----
-const gotSingleInstanceLock = app.requestSingleInstanceLock();
-if (!gotSingleInstanceLock) {
-  // Another instance already running; exit immediately.
-  try { console.log('[lifecycle] secondary instance exiting (single-instance lock)'); } catch(_) {}
-  app.quit();
-} else {
-  app.on('second-instance', (_event, _commandLine, _workingDir) => {
-    // Another launch attempt occurred: surface/focus existing window or trigger unlock prompt.
-    try {
-      if (typeof broadcast === 'function') {
-        try { broadcast('log:line', '[lifecycle] second instance attempt; focusing existing window'); } catch(_) {}
-      }
-      if (_needPassGlobal && !unlockedUI && typeof _promptAndValidateBlocking === 'function') {
-        _promptAndValidateBlocking();
-        return;
-      }
-      const wins = BrowserWindow.getAllWindows();
-      if (!wins.length) {
-        try { createWindow(); } catch(_) {}
-      } else {
-        const win = wins[0];
-        try {
-          if (win.isMinimized()) win.restore();
-          win.show();
-          win.focus();
-        } catch(_) {}
-      }
-    } catch(_) {}
-  });
-}
-function resolveIconPath() {
-  const p = path.join(__dirname, 'hindsight_icon.png');
-  return fs.existsSync(p) ? p : null;
-}
-function createTray() {
-  try {
-    const iconPath = resolveIconPath();
-    let icon;
-    if (iconPath) icon = nativeImage.createFromPath(iconPath);
-    tray = new Tray(icon || nativeImage.createEmpty());
-    const buildMenu = () => {
-    const running = !!readPid();
-      return Menu.buildFromTemplate([
-        {label: 'Open Window', click: async () => {
-      if (_needPassGlobal && !unlockedUI) {
-            if (typeof _promptAndValidateBlocking === 'function') {
-              await _promptAndValidateBlocking();
-            }
-          }
-          if (BrowserWindow.getAllWindows().length===0) createWindow(); else BrowserWindow.getAllWindows()[0].show();
-        }},
-  {label: running ? 'Stop Capture' : 'Start Capture', click: () => { running ? stopDetached() : startDetached(prefs.interval||5,{userInitiated:true}); }},
-        {type: 'separator'},
-        {label: 'Quit', click: () => { app.quit(); }}
-      ]);
-    };
-    tray.setToolTip('Hindsight Recall');
-    tray.setContextMenu(buildMenu());
-    setInterval(()=> tray.setContextMenu(buildMenu()), 4000);
-    tray.on('click', async () => {
-      if (_needPassGlobal && !unlockedUI) {
-        if (typeof _promptAndValidateBlocking === 'function') {
-          await _promptAndValidateBlocking();
-        }
-      }
-      const wins=BrowserWindow.getAllWindows(); if (wins.length) { wins[0].show(); } else createWindow();
-    });
-  } catch (e) {
-    console.error('Tray init failed', e);
-  }
-}
-const {spawn} = require('child_process');
+const {AuthManager} = require('./authManager');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const {spawn, spawnSync} = require('child_process');
+// Logging utilities (all provided by ./logging; tzTimestamp now sourced there)
+let deriveLevelFromCategory, tzTimestamp, makeLogger; // lazy-required below to avoid early refactor breakages
+let tray = null;
+// Capture key availability (data key accessible for service restarts)
+let unlockedSuccessfully = false; // legacy mirror of authManager.isUnlocked()
+// Removed legacy unlockedUI flag: UI prompts every open.
+let suppressNextUiPrompt = false; // one-shot bypass after an immediate pre-prompt
+// Stronger guarantee that a main window is visible & focused shortly after unlock/open attempts.
+function forceShowMainWindow(retries=4) {
+  try {
+    let win = BrowserWindow.getAllWindows()[0];
+    if (!win) {
+      suppressNextUiPrompt = true; // skip prompt in createWindow path
+      createWindow();
+      win = BrowserWindow.getAllWindows()[0];
+    }
+    if (win) {
+      try {
+        if (win.isMinimized()) win.restore();
+        win.show();
+        win.focus();
+  // Removed win.moveTop() to avoid triggering X11 _NET_RESTACK_WINDOW atom warning
+      } catch(_) {}
+    }
+    if (retries > 0) {
+      // In some DEs initial show can be overridden; retry a few times.
+      setTimeout(()=>forceShowMainWindow(retries-1), 180);
+    }
+  } catch(_) {}
+}
+// Expose passphrase prompt function & needPass flag to tray handlers after initialization.
+let _promptAndValidateBlocking = null;
+let _needPassGlobal = false; // mirrors authManager.needsPass()
+let authManager = null;
+let mainWindow = null; // persistent reference to keep window alive
 
+// Path & Python helpers (restored)
 function projectRoot() { return path.resolve(__dirname, '..'); }
 
 function getPythonCommand() {
   const venv = path.join(projectRoot(), '.venv');
   if (process.platform === 'win32') {
-    const pythonw = path.join(venv, 'Scripts', 'pythonw.exe');
-    const python = path.join(venv, 'Scripts', 'python.exe');
-    if (fs.existsSync(pythonw)) return pythonw;
-    if (fs.existsSync(python)) return python;
-    return 'pythonw';
-  } else {
-    const py = path.join(venv, 'bin', 'python');
+    const pyw = path.join(venv, 'Scripts', 'pythonw.exe');
+    const py = path.join(venv, 'Scripts', 'python.exe');
+    if (fs.existsSync(pyw)) return pyw;
     if (fs.existsSync(py)) return py;
+    return 'python';
+  } else {
+    const exe = path.join(venv, 'bin', 'python');
+    if (fs.existsSync(exe)) return exe;
     return 'python3';
   }
+}
+
+// Read PID of detached capture process (returns number or null if invalid/nonexistent)
+function readPid() {
+  try {
+    const txt = fs.readFileSync(PID_FILE, 'utf8').trim();
+    if (!txt) return null;
+    const n = Number(txt);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    // Optionally verify process existence (best-effort)
+    try { process.kill(n, 0); } catch(_) { return null; }
+    return n;
+  } catch(_) {
+    return null;
+  }
+}
+
+// Synchronous python helper runner (used for keymgr operations & one-off helpers)
+function runPyHelper(pyArgs, opts={}) {
+  try {
+    const py = getPythonCommand();
+    const args = Array.isArray(pyArgs) ? pyArgs.slice() : [];
+    const env = {...process.env};
+    // Ensure data directory variables propagate if needed
+    if (!env.HINDSIGHT_BASE_DIR) {
+      try { env.HINDSIGHT_BASE_DIR = path.join(projectRoot(), 'data'); } catch(_) {}
+    }
+    const res = spawnSync(py, args, {
+      input: opts.input || undefined,
+      encoding: 'utf8',
+      env,
+      timeout: opts.timeout || 15000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return {status: res.status, stdout: res.stdout, stderr: res.stderr, error: res.error};
+  } catch (e) {
+    return {status: -1, stdout: '', stderr: '', error: e};
+  }
+}
+
+function tzTsWrapper() {
+  if (!tzTimestamp) { try { ({tzTimestamp} = require('./logging')); } catch(_) {} }
+  let ts = '1970-01-01T00:00:00.000+00:00';
+  try { ts = tzTimestamp(prefs); } catch(_) {}
+  return ts;
 }
 
 // ---- Preferences Handling ----
@@ -110,9 +111,9 @@ function loadPrefs() {
   try {
     const raw = fs.readFileSync(PREFS_PATH, 'utf8');
     const parsed = JSON.parse(raw);
-  return Object.assign({autostart: false, interval: 5, delaySeconds: 0, backend: 'auto', logTimezone: 'LOCAL', dstAdjust: false}, parsed);
+  return Object.assign({autostart:false, interval:5, delaySeconds:0, backend:'auto', logTimezone:'LOCAL', dstAdjust:false, logLevel:'INFO', logRotationMB:2}, parsed);
   } catch {
-  return {autostart: false, interval: 5, delaySeconds: 0, backend: 'auto', logTimezone: 'LOCAL', dstAdjust: false};
+  return {autostart:false, interval:5, delaySeconds:0, backend:'auto', logTimezone:'LOCAL', dstAdjust:false, logLevel:'INFO', logRotationMB:2};
   }
 }
 function savePrefs(p) {
@@ -120,6 +121,44 @@ function savePrefs(p) {
   fs.writeFileSync(PREFS_PATH, JSON.stringify(p, null, 2), 'utf8');
 }
 let prefs = loadPrefs();
+
+// Resolve icon path (prefers packaged / dev icon file)
+function resolveIconPath() {
+  try {
+    const candidate = path.join(__dirname, 'hindsight_icon.png');
+    if (fs.existsSync(candidate)) return candidate;
+    const rootCandidate = path.join(projectRoot(), 'frontend', 'hindsight_icon.png');
+    if (fs.existsSync(rootCandidate)) return rootCandidate;
+  } catch(_) {}
+  return null;
+}
+
+function createTray() {
+  if (tray) return tray;
+  try {
+    const iconPath = resolveIconPath();
+    const image = iconPath ? nativeImage.createFromPath(iconPath) : undefined;
+    tray = new Tray(image || nativeImage.createEmpty());
+    const ctx = Menu.buildFromTemplate([
+      {label: 'Show', click: ()=> { try { forceShowMainWindow(); } catch(_) {} }},
+      {label: 'Start Capture', click: ()=> { try { startDetached(prefs.interval||5,{userInitiated:true}); } catch(_) {} }},
+      {label: 'Stop Capture', click: ()=> { try { stopDetached(); } catch(_) {} }},
+      {label: 'Quit', click: ()=> { try { app.quit(); } catch(_) {} }},
+    ]);
+    tray.setToolTip('Hindsight Recall');
+    tray.setContextMenu(ctx);
+    tray.on('click', ()=> { try { forceShowMainWindow(); } catch(_) {} });
+    return tray;
+  } catch(e) {
+    try { console.error('tray create failed', e); } catch(_) {}
+    return null;
+  }
+}
+
+// Early bootstrap diagnostic log
+try { console.log('[diag] main bootstrap start'); } catch(_) {}
+try { (global.__EARLY_DIAG = Date.now()); } catch(_) {}
+try { if (typeof log === 'function') log('lifecycle','bootstrap phase reached'); } catch(_) {}
 
 // ---- Detached Capture Supervisory Control ----
 const PID_FILE = path.join(projectRoot(), 'data', 'capture.pid');
@@ -144,11 +183,16 @@ let systemPaused = false; // true while system is locked/suspended and capture i
 let lastPolledLockState = null; // track last known lock state (linux)
 let spawnInFlight = false; // prevent overlapping spawns when pid file never appears
 let captureProc = null; // hold child process reference when not detached for diagnostics
+// Renderer status broadcast tracking
+let lastBroadcastSequence = -1;
+let lastBroadcastCaptureCount = -1;
+let lastBroadcastError = null;
+let lastBroadcastInstance = null;
 
 function pauseCaptureForSystem(kind) {
   if (systemPaused) return;
   systemPaused = true;
-  broadcast('log:line', '[lifecycle] capture paused (system)');
+  log('lifecycle', 'capture paused (system)');
   const pid = readPid();
   if (pid) {
     try { process.kill(pid, 'SIGTERM'); } catch(_) {}
@@ -158,7 +202,7 @@ function pauseCaptureForSystem(kind) {
 
 function resumeCaptureAfterSystem(kind) {
   if (!systemPaused) return;
-  broadcast('log:line', '[lifecycle] capture resumed (system)');
+  log('lifecycle', 'capture resumed (system)');
   systemPaused = false;
   if (!readPid() && !userRequestedStop) {
     // slight delay to allow display/session to fully restore
@@ -251,7 +295,7 @@ function scanForOtherCaptureProcesses(callback) {
         others.push({pid, cmd: m[2]});
       }
       if (others.length) {
-        broadcast('log:line', `[anomaly] detected ${others.length} additional capture process(es): ${others.map(o=>o.pid).join(',')}`);
+  log('anomaly', `detected ${others.length} additional capture process(es): ${others.map(o=>o.pid).join(',')}`);
       }
       if (callback) callback(others);
     } catch(_) { if (callback) callback([]); }
@@ -269,16 +313,16 @@ function startDetached(interval, opts={}) {
   const pid = readPid();
   if (pid) return {action:'already', pid};
   if (userRequestedStop && !opts.userInitiated) {
-    broadcast('log:line', '[control] auto start suppressed (user stop active)');
+  log('control', 'auto start suppressed (user stop active)');
     return {action:'suppressed'};
   }
   if (spawnInFlight) {
-    broadcast('log:line', '[control] spawn already in-flight; skipping duplicate start request');
+  log('control', 'spawn already in-flight; skipping duplicate start request');
     return {action:'in-flight'};
   }
   // If a passphrase is required but not yet unlocked, defer.
   if (_needPassGlobal && !unlockedSuccessfully) {
-    broadcast('log:line', '[control] start requested but key not yet unlocked; deferring');
+  log('control', 'start requested but key not yet unlocked; deferring');
     return {action:'deferred'};
   }
   if (opts.userInitiated) {
@@ -293,7 +337,7 @@ function startDetached(interval, opts={}) {
       }
       setTimeout(()=>{
         for (const procInfo of list) {
-          try { process.kill(procInfo.pid, 0); process.kill(procInfo.pid, 'SIGKILL'); broadcast('log:line', `[control] escalated SIGKILL stray pid=${procInfo.pid}`); } catch(_) {}
+          try { process.kill(procInfo.pid, 0); process.kill(procInfo.pid, 'SIGKILL'); log('control', `escalated SIGKILL stray pid=${procInfo.pid}`); } catch(_) {}
         }
       }, 700);
     }
@@ -305,12 +349,15 @@ function startDetached(interval, opts={}) {
       if (!/"sequence"\s*:/.test(txt)) {
         const archived = STATUS_FILE + '.legacy-' + Date.now();
         fs.renameSync(STATUS_FILE, archived);
-        broadcast('log:line', `[lifecycle] archived legacy status file -> ${path.basename(archived)}`);
+  log('lifecycle', `archived legacy status file -> ${path.basename(archived)}`);
       }
     }
   } catch(_) {}
   const py = getPythonCommand();
-  const args = [py, '-m', 'capture.cli', '--dir', path.join(projectRoot(),'data'), '--interval', String(interval||5), '--print-status', '--pid-file', PID_FILE];
+  // Removed '--print-status' to avoid very long STATUS:: JSON lines in stdout (status file still polled separately)
+  const args = [py, '-m', 'capture.cli', '--dir', path.join(projectRoot(),'data'), '--interval', String(interval||5), '--pid-file', PID_FILE];
+  // Append log level argument (safe even if capture.cli ignores unknown flag in older versions)
+  try { if (prefs && prefs.logLevel) args.push('--log-level', String(prefs.logLevel)); } catch(_) {}
   const env = {...process.env};
   if (prefs.backend && prefs.backend !== 'auto') {
     env.HINDSIGHT_FORCE_BACKEND = prefs.backend;
@@ -333,194 +380,41 @@ function startDetached(interval, opts={}) {
     const outPath = path.join(logDir, 'capture.stdout.log');
     const errPath = path.join(logDir, 'capture.stderr.log');
     const outFd = fs.openSync(outPath, 'a');
-    const errFd = fs.openSync(errPath, 'a');
-    fs.writeSync(outFd, `\n==== spawn ${new Date().toISOString()} interval=${interval||5} ====`);
-    fs.writeSync(errFd, `\n==== spawn ${new Date().toISOString()} interval=${interval||5} ====`);
+  } catch (_) {}
+  // spawn child detached
+  try {
+    const child = spawn(py, args.slice(1), {detached:true, stdio:['ignore', 'ignore', 'ignore'], env});
+    child.unref();
     spawnInFlight = true;
-    captureProc = spawn(args[0], args.slice(1), {detached: false, stdio:['ignore', outFd, errFd], cwd: projectRoot(), env});
-    broadcast('log:line', `[control] started capture (interval=${interval||5}s)`);
-    captureProc.on('exit', (code, signal) => {
-      spawnInFlight = false;
-      const msg = `[anomaly] capture process exited early code=${code} signal=${signal || 'none'} pidFileExists=${!!readPid()}`;
-      broadcast('log:line', msg);
-      try { fs.writeSync(errFd, `\n${msg}`); } catch(_) {}
-      captureProc = null;
-    });
+    log('control', `started capture (interval=${interval||5}s)`);
+    setTimeout(()=>{ if (!readPid()) log('anomaly', 'capture spawn produced no pid file (will retry later)'); else spawnInFlight = false; }, 1800);
   } catch (e) {
-    broadcast('log:line', `[error] failed to spawn capture: ${e.message}`);
-    return {action:'error', error:e.message};
+    log('error', `failed to spawn capture: ${e.message}`, 'ERROR');
   }
-  // Verify pid file appears shortly; if not, log anomaly for troubleshooting.
-  setTimeout(()=>{ if (!readPid()) broadcast('log:line', '[anomaly] capture spawn produced no pid file (will retry later)'); else spawnInFlight = false; }, 1800);
-  return {action:'started'};
+  setTimeout(pollStatus, 2000);
 }
+setTimeout(pollStatus, 1500);
 
 function stopDetached() {
   const pid = readPid();
   if (!pid) {
-    // Fallback: if we have a live child process reference but no pid file yet, terminate it.
-    if (captureProc) {
-      try { captureProc.kill('SIGTERM'); broadcast('log:line','[control] stop requested (child only, no pid file)'); } catch(_) {}
-      return {action:'signaled-child-only'};
-    }
-    return {action:'not-running'};
+    userRequestedStop = true; // still suppress auto restarts
+    return {action:'none'};
   }
-  userRequestedStop = true;
-  if (pendingRestartTimer) { clearTimeout(pendingRestartTimer); pendingRestartTimer = null; }
-  try {
-    process.kill(pid, 'SIGTERM');
-  } catch (e) {
-    return {action:'error', error:String(e)};
-  }
-  broadcast('log:line', '[control] stop requested (SIGTERM)');
-  broadcast('log:line', '[control] auto-restart suppressed until user starts capture again');
-  // Schedule a verification/escalation if still alive after 800ms.
-  setTimeout(() => {
-    const still = readPid();
-    if (still === pid) {
-      try { process.kill(pid, 'SIGKILL'); } catch(_) {}
-  broadcast('log:line', '[control] escalated SIGKILL');
-    }
-  }, 800);
+  try { process.kill(pid, 'SIGTERM'); } catch(_) {}
+  setTimeout(()=>{ try { if (readPid() === pid) process.kill(pid, 'SIGKILL'); } catch(_) {} }, 1200);
+  userRequestedStop = true; // suppress auto restarts until user starts again
+  log('control', 'stop requested (SIGTERM)');
+  log('control', 'auto-restart suppressed until user starts capture again');
   return {action:'signaled', pid};
 }
-
-function readPid() {
-  try {
-    const txt = fs.readFileSync(PID_FILE,'utf8').trim();
-    const pid = Number(txt);
-    if (!pid) return null;
-    try { process.kill(pid,0); return pid; } catch { return null; }
-  } catch { return null; }
-}
-
-function pollStatus() {
-  try {
-    const raw = fs.readFileSync(STATUS_FILE,'utf8');
-    const data = JSON.parse(raw);
-    broadcast('status:update', data);
-    // Health check: detect stale display errors (e.g., after relogin)
-  if (data && data.error) {
-      const err = String(data.error);
-      if (/unable to open display|cannot open display|xopendisplay/i.test(err)) {
-        consecutiveDisplayErrors += 1;
-        broadcast('log:line', `[health] display error (${consecutiveDisplayErrors}) ${err}`);
-      } else {
-        consecutiveDisplayErrors = 0;
-      }
-      // Auto backend adaptation: if imagegrab keeps producing UnidentifiedImageError, switch prefs.backend to 'mss' and restart once.
-      if (/UnidentifiedImageError/.test(err) && /imagegrab/.test(String(data.capture_backend||''))) {
-        consecutiveUnidentified++;
-        if (consecutiveUnidentified === 3) {
-          if (prefs.backend !== 'mss') {
-            broadcast('log:line', '[health] repeated UnidentifiedImageError with imagegrab; switching backend to mss and restarting');
-            prefs.backend = 'mss';
-            savePrefs(prefs);
-            backendSwitchReason = 'imagegrab_unidentifiedimageerror';
-            internalStopForHealth();
-            setTimeout(()=>{ if (!userRequestedStop) startDetached(prefs.interval||5); }, 1000);
-          }
-        }
-      } else if (!/UnidentifiedImageError/.test(err)) {
-        consecutiveUnidentified = 0;
-      }
-    } else {
-      consecutiveDisplayErrors = 0;
-      lastSuccessfulStatus = Date.now();
-      consecutiveUnidentified = 0;
-    }
-    // Emit capture / error change logs
-    if (data) {
-      // Skip stale status (older sequence or missing sequence after we've seen one)
-      if (typeof data.sequence === 'number') {
-        // Detect instance change earlier (before stale check) so we can accept a lower sequence
-        if (data.service_instance_id && lastServiceInstance && data.service_instance_id !== lastServiceInstance) {
-          broadcast('log:line', `[lifecycle] new service instance detected (sequence baseline reset) ${data.service_instance_id}`);
-          lastSequence = -1; // reset baseline to accept new lower sequence
-        }
-        if (lastSequence !== -1 && data.sequence < lastSequence) {
-          broadcast('log:line', `[stale] ignoring out-of-order status sequence=${data.sequence} < ${lastSequence}`);
-          return; // do not process further
-        }
-      } else if (lastSequence !== -1) {
-        broadcast('log:line', '[stale] ignoring legacy status without sequence');
-        return;
-      }
-      if (data.service_instance_id && data.service_instance_id !== lastInstanceId) {
-        // New service instance detected; reset counters to avoid false regression warnings
-        broadcast('log:line', `[lifecycle] detected new capture service instance ${data.service_instance_id}`);
-        lastInstanceId = data.service_instance_id;
-        lastLoggedCaptureCount = -1;
-        lastLoggedError = null;
-        lastSequence = -1;
-  lastStatusUtc = null;
-  // After detecting new instance, scan for strays once.
-  scanForOtherCaptureProcesses();
-      }
-      if (typeof data.capture_count === 'number' && data.capture_count !== lastLoggedCaptureCount) {
-        broadcast('log:line', `[capture] #${data.capture_count} window="${data.window_title}" backend=${data.capture_backend||'n/a'}`);
-        // Anomaly: capture_count regression implies competing process or stale writer (only within same instance)
-        if (lastInstanceId && lastLoggedCaptureCount !== -1 && data.capture_count < lastLoggedCaptureCount - 3) {
-          broadcast('log:line', `[anomaly] capture_count regressed from ${lastLoggedCaptureCount} to ${data.capture_count}; possible stale secondary process`);
-        }
-        lastLoggedCaptureCount = data.capture_count;
-      } else if (data.duplicate === true) {
-        // Explicitly log duplicate frame skipped to surface suppression behavior.
-        broadcast('log:line', `[duplicate] skipped frame (same as previous) window="${data.window_title}"`);
-      }
-      if (typeof data.sequence === 'number' && data.sequence > lastSequence) {
-        lastSequence = data.sequence;
-        lastSequenceTs = Date.now();
-        if (data.service_instance_id) lastServiceInstance = data.service_instance_id;
-      }
-      if (!data.sequence && lastInstanceId) {
-        // Legacy/no-sequence status after we've seen a proper instance id => likely stale or competing writer.
-        const lc = data.last_capture_utc || 'unknown';
-        broadcast('log:line', `[anomaly] legacy status overwrite detected (utc=${lc}); possible old process still running`);
-        // Trigger scan to list stray processes.
-        scanForOtherCaptureProcesses();
-      }
-      if (data.last_capture_utc) {
-        lastStatusUtc = data.last_capture_utc;
-      }
-      if (data.last_capture_utc && data.last_capture_utc !== lastLoggedUtc) {
-        lastLoggedUtc = data.last_capture_utc;
-      }
-      const errNow = data.error || null;
-      if (errNow !== lastLoggedError) {
-        if (errNow) broadcast('log:line', `[error] ${errNow}`); else if (lastLoggedError) broadcast('log:line', '[recovery] error cleared');
-        lastLoggedError = errNow;
-      }
-    }
-    // Heartbeat every 30s if no new capture logs
-    const nowTs = Date.now();
-    if (nowTs - lastHeartbeat > 30000) {
-      broadcast('log:line', `[heartbeat] pid=${readPid()||'none'} captures=${lastLoggedCaptureCount} displayErrs=${consecutiveDisplayErrors}`);
-      lastHeartbeat = nowTs;
-    }
-    const threshold = lastSuccessfulStatus === 0 ? 1 : 3; // before first success, restart on first display error
-  if (!userRequestedStop && !systemPaused && consecutiveDisplayErrors >= threshold) {
-      const now = Date.now();
-      if (now - lastHealthRestart > 15000) { // 15s cooldown
-  broadcast('log:line', '[health] Display error detected repeatedly; scheduling restart');
-  internalStopForHealth();
-  if (pendingRestartTimer) { clearTimeout(pendingRestartTimer); }
-  pendingRestartTimer = setTimeout(()=>{ if (!userRequestedStop) startDetached(prefs.interval || 5); pendingRestartTimer=null; }, 1200);
-        lastHealthRestart = now;
-        consecutiveDisplayErrors = 0; // reset counter
-      }
-    }
-  } catch {/* ignore */}
-  setTimeout(pollStatus, 2000);
-}
-setTimeout(pollStatus, 1500);
 
 // Stall detector: if no sequence progress for > 20s while pid alive, restart.
 setInterval(() => {
   const pid = readPid();
   if (!pid) return;
   if (!systemPaused && lastSequence !== -1 && Date.now() - lastSequenceTs > 20000) {
-    broadcast('log:line', '[health] capture appears stalled (no sequence advance >20s); restarting');
+  log('health', 'capture appears stalled (no sequence advance >20s); restarting');
     internalStopForHealth();
     setTimeout(()=>{ if (!userRequestedStop) startDetached(prefs.interval||5); }, 1200);
   }
@@ -532,121 +426,180 @@ function killOtherCaptureProcesses() {
       try { process.kill(p.pid, 'SIGTERM'); } catch(_) {}
       setTimeout(()=>{ try { process.kill(p.pid, 0); process.kill(p.pid, 'SIGKILL'); } catch(_) {} }, 600);
     }
-    if (list.length) broadcast('log:line', `[control] signaled stray capture processes (${list.map(x=>x.pid).join(',')})`);
+  if (list.length) log('control', `signaled stray capture processes (${list.map(x=>x.pid).join(',')})`);
     setTimeout(()=>{
-      scanForOtherCaptureProcesses(remain => { if (remain.length) broadcast('log:line', `[anomaly] stray processes still alive after kill attempt: ${remain.map(r=>r.pid).join(',')}`); });
+  scanForOtherCaptureProcesses(remain => { if (remain.length) log('anomaly', `stray processes still alive after kill attempt: ${remain.map(r=>r.pid).join(',')}`); });
     }, 1500);
   });
   return {requested:true};
 }
 
-function tzTimestamp() {
-  // Use user preference `logTimezone` if present.
-  // Supported values:
-  //   'LOCAL' (default) -> system local time & offset
-  //   'UTC'             -> UTC with +00:00 offset
-  //   [+|-]HHMM         -> Fixed offset from UTC
-  const spec = (typeof prefs !== 'undefined' && prefs && typeof prefs.logTimezone === 'string') ? prefs.logTimezone.trim().toUpperCase() : 'LOCAL';
-  const pad = (n, l=2) => String(n).padStart(l,'0');
-  const now = new Date();
-  let year, mon, day, hr, min, sec, ms, offSign, offH, offM;
-  let dstAddHour = prefs && prefs.dstAdjust ? 1 : 0;
-  if (spec === 'UTC') {
-    year = now.getUTCFullYear();
-    mon = pad(now.getUTCMonth()+1);
-    day = pad(now.getUTCDate());
-    hr = pad((now.getUTCHours()+dstAddHour)%24);
-    min = pad(now.getUTCMinutes());
-    sec = pad(now.getUTCSeconds());
-    ms = pad(now.getUTCMilliseconds(),3);
-    offSign = '+'; offH = '00'; offM = '00';
-  } else if (/^[+-]\d{4}$/.test(spec)) {
-    // Fixed offset: convert to that offset's local wall time by applying offset minutes to UTC
-    const sign = spec[0] === '-' ? -1 : 1;
-    const h = parseInt(spec.slice(1,3),10);
-    const m = parseInt(spec.slice(3,5),10);
-    const totalMin = sign * (h*60 + m);
-    // Apply DST adjustment to both displayed clock time and resulting offset minutes.
-    // For a negative offset (-0800) a DST +1h means -0700 (i.e. totalMin + 60).
-    let adjustedMin = totalMin;
-    if (dstAddHour) {
-      adjustedMin = totalMin + 60; // works for positive & negative offsets
-    }
-    const dateMs = now.getTime() + adjustedMin * 60000; // shift from UTC using (possibly) adjusted offset
-    const d = new Date(dateMs);
-    year = d.getUTCFullYear();
-    mon = pad(d.getUTCMonth()+1);
-    day = pad(d.getUTCDate());
-    hr = pad(d.getUTCHours());
-    min = pad(d.getUTCMinutes());
-    sec = pad(d.getUTCSeconds());
-    ms = pad(d.getUTCMilliseconds(),3);
-    // Recompute printable offset from adjusted minutes
-    const adjAbs = Math.abs(adjustedMin);
-    const adjSign = adjustedMin <= 0 ? '-' : '+'; // adjustedMin negative -> west of UTC
-    offSign = adjSign;
-    offH = pad(Math.floor(adjAbs/60));
-    offM = pad(adjAbs % 60);
-  } else { // LOCAL fallback
-    year = now.getFullYear();
-    mon = pad(now.getMonth()+1);
-    day = pad(now.getDate());
-  hr = pad((now.getHours()+dstAddHour)%24);
-    min = pad(now.getMinutes());
-    sec = pad(now.getSeconds());
-    ms = pad(now.getMilliseconds(),3);
-    const offMin = now.getTimezoneOffset();
-    const sign = offMin <= 0 ? '+' : '-';
-    const abs = Math.abs(offMin);
-    offH = pad(Math.floor(abs/60));
-    offM = pad(abs % 60);
-    offSign = sign;
-  }
-  // Derive a human-friendly timezone abbreviation.
-  let abbrev = '';
+// Poll and process status.json periodically.
+function pollStatus() {
   try {
-    const baseSpec = spec; // user-selected
-    // Mapping for standard offsets (non-DST) and DST variants when dstAdjust applied to original spec.
-    const stdMap = { '-0800':'PST','-0700':'MST','-0600':'CST','-0500':'EST','-0400':'AST','+0000':'UTC','+0100':'CET','+0200':'EET'};
-    const dstMap = { '-0800':'PDT','-0700':'MDT','-0600':'CDT','-0500':'EDT','-0400':'ADT','+0100':'CEST','+0200':'EEST'};
-    if (baseSpec === 'LOCAL') {
-      // Use Intl API for local abbreviation.
-      try {
-        const fmt = new Intl.DateTimeFormat(undefined, {timeZoneName:'short'});
-        const parts = fmt.formatToParts(new Date());
-        const tzp = parts.find(p=>p.type==='timeZoneName');
-        if (tzp && tzp.value) abbrev = tzp.value.toUpperCase();
-      } catch(_) {}
-    } else if (/^[+-]\d{4}$/.test(baseSpec)) {
-      const norm = baseSpec.toUpperCase();
-      if (prefs && prefs.dstAdjust) {
-        // dstAdjust shifts effective offset already; prefer DST map based on original spec before shift.
-        if (dstMap[norm]) abbrev = dstMap[norm];
+    if (!fs.existsSync(STATUS_FILE)) return; // nothing yet
+    let dataRaw;
+    try { dataRaw = fs.readFileSync(STATUS_FILE,'utf8'); } catch(_) { return; }
+    let data;
+    try { data = JSON.parse(dataRaw); } catch(_) { return; }
+    if (data) {
+      // Detect instance change earlier (before stale check) so we can accept a lower sequence
+      if (data.service_instance_id && lastServiceInstance && data.service_instance_id !== lastServiceInstance) {
+        log('lifecycle', `new service instance detected (sequence baseline reset) ${data.service_instance_id}`);
+        lastSequence = -1; // reset baseline
       }
-      if (!abbrev && stdMap[norm]) abbrev = stdMap[norm];
-      if (!abbrev) {
-        // Fallback generic label.
-        abbrev = 'UTC' + (offSign==='+'?'+':'-') + offH + (offM!=='00'?(':'+offM):'');
+      if (typeof data.sequence === 'number') {
+        if (lastSequence !== -1 && data.sequence < lastSequence) {
+          log('stale', `ignoring out-of-order status sequence=${data.sequence} < ${lastSequence}`);
+          return;
+        }
+      } else if (lastSequence !== -1) {
+        log('stale', 'ignoring legacy status without sequence');
+        return;
       }
-    } else if (baseSpec === 'UTC') {
-      abbrev = 'UTC';
+      if (data.service_instance_id && data.service_instance_id !== lastInstanceId) {
+        log('lifecycle', `detected new capture service instance ${data.service_instance_id}`);
+        lastInstanceId = data.service_instance_id;
+        lastLoggedCaptureCount = -1;
+        lastLoggedError = null;
+        lastSequence = -1;
+        lastStatusUtc = null;
+        scanForOtherCaptureProcesses();
+      }
+      if (typeof data.capture_count === 'number' && data.capture_count !== lastLoggedCaptureCount) {
+        log('capture', `#${data.capture_count} window="${data.window_title}" backend=${data.capture_backend||'n/a'}`);
+        if (lastInstanceId && lastLoggedCaptureCount !== -1 && data.capture_count < lastLoggedCaptureCount - 3) {
+          log('anomaly', `capture_count regressed from ${lastLoggedCaptureCount} to ${data.capture_count}; possible stale secondary process`);
+        }
+        lastLoggedCaptureCount = data.capture_count;
+      } else if (data.duplicate === true) {
+        log('duplicate', `skipped frame (same as previous) window="${data.window_title}"`);
+      }
+      if (typeof data.sequence === 'number' && data.sequence > lastSequence) {
+        lastSequence = data.sequence;
+        lastSequenceTs = Date.now();
+        if (data.service_instance_id) lastServiceInstance = data.service_instance_id;
+      }
+      if (!data.sequence && lastInstanceId) {
+        const lc = data.last_capture_utc || 'unknown';
+        log('anomaly', `legacy status overwrite detected (utc=${lc}); possible old process still running`);
+        scanForOtherCaptureProcesses();
+      }
+      if (data.last_capture_utc) lastStatusUtc = data.last_capture_utc;
+      if (data.last_capture_utc && data.last_capture_utc !== lastLoggedUtc) {
+        lastLoggedUtc = data.last_capture_utc;
+      }
+      const errNow = data.error || null;
+      if (errNow !== lastLoggedError) {
+        if (errNow) log('error', errNow, 'ERROR'); else if (lastLoggedError) log('recovery', 'error cleared');
+        lastLoggedError = errNow;
+      }
+      // Decide if we should broadcast status to renderer (avoid flooding)
+      const seqChanged = (typeof data.sequence === 'number' && data.sequence !== lastBroadcastSequence);
+      const capChanged = (typeof data.capture_count === 'number' && data.capture_count !== lastBroadcastCaptureCount);
+      const errChanged = (errNow !== lastBroadcastError);
+      const instChanged = (data.service_instance_id && data.service_instance_id !== lastBroadcastInstance);
+      if (seqChanged || capChanged || errChanged || instChanged) {
+        try {
+          broadcast('status:update', {
+            capture_count: data.capture_count,
+            window_title: data.window_title,
+            last_capture_utc: data.last_capture_utc,
+            error: errNow,
+            capture_backend: data.capture_backend,
+            duplicate: !!data.duplicate,
+            service_instance_id: data.service_instance_id,
+            sequence: data.sequence,
+            backend_switch_reason: data.backend_switch_reason,
+            interval: prefs.interval || 5,
+          });
+        } catch(_) {}
+        if (typeof data.sequence === 'number') lastBroadcastSequence = data.sequence;
+        if (typeof data.capture_count === 'number') lastBroadcastCaptureCount = data.capture_count;
+        lastBroadcastError = errNow;
+        if (data.service_instance_id) lastBroadcastInstance = data.service_instance_id;
+      }
     }
-  } catch(_) {}
-  const ts = `${year}-${mon}-${day}T${hr}:${min}:${sec}.${ms}${offSign}${offH}:${offM}${abbrev?(' '+abbrev):''}`;
-  try {
-    if (Math.random() < 0.002) { // sample occasionally to avoid log spam
-      broadcast('log:line', `[tz] spec=${spec} dst=${!!(prefs && prefs.dstAdjust)} -> ${ts}`);
+    const nowTs = Date.now();
+    if (nowTs - lastHeartbeat > 30000) {
+      log('heartbeat', `pid=${readPid()||'none'} captures=${lastLoggedCaptureCount} displayErrs=${consecutiveDisplayErrors}`);
+      lastHeartbeat = nowTs;
     }
-  } catch(_) {}
-  return ts;
+    const threshold = lastSuccessfulStatus === 0 ? 1 : 3;
+    if (!userRequestedStop && !systemPaused && consecutiveDisplayErrors >= threshold) {
+      const now = Date.now();
+      if (now - lastHealthRestart > 15000) {
+        log('health', 'Display error detected repeatedly; scheduling restart');
+        internalStopForHealth();
+        if (pendingRestartTimer) { clearTimeout(pendingRestartTimer); }
+        pendingRestartTimer = setTimeout(()=>{ if (!userRequestedStop) startDetached(prefs.interval || 5); pendingRestartTimer=null; }, 1200);
+        lastHealthRestart = now;
+        consecutiveDisplayErrors = 0;
+      }
+    }
+  } catch (_) {}
+  setTimeout(pollStatus, 2000);
 }
+setTimeout(pollStatus, 1500);
+// ---- Shared Log Level Derivation Helper ----
+// deriveLevelFromCategory now provided by ./logging
+// Use shared logger factory.
+let log = function(category, message, levelOverride) {
+  try {
+    if (!makeLogger) { ({makeLogger} = require('./logging')); }
+    // create once when first needed
+  log = makeLogger({broadcast, getPrefs: ()=> prefs});
+  try { console.log('[diag] logger initialized'); } catch(_) {}
+  const out = log(category, message, levelOverride);
+  return out;
+  } catch(e) {
+    try { broadcast('log:line', `[ERROR] [log] logger init failure ${e.message}`); } catch(_) {}
+  }
+};
 function broadcast(channel, payload) {
   // Also append log lines to a rolling file for diagnostics (timezone-aware local timestamp with offset).
   try {
     if (channel === 'log:line') {
       const logPath = path.join(projectRoot(), 'data', 'frontend.log');
       try { fs.mkdirSync(path.dirname(logPath), {recursive:true}); } catch(_) {}
-      fs.appendFileSync(logPath, tzTimestamp() + ' ' + payload + '\n');
+  try { if (Math.random() < 0.01) console.log('[diag] broadcast log payload:', payload.slice(0,120)); } catch(_) {}
+      // Unified log() now always supplies a leading [LEVEL]; if absent, attempt lightweight derivation.
+  const levelTokenRegex = /^\[(DEBUG|INFO|WARNING|ERROR|CRITICAL|TRACE)\]/i;
+      let lvl = 'INFO';
+      let body = payload;
+      if (levelTokenRegex.test(payload)) {
+        lvl = payload.match(levelTokenRegex)[1].toUpperCase();
+        body = payload.replace(levelTokenRegex, '').trimStart();
+      } else {
+        try {
+          if (!deriveLevelFromCategory) { ({deriveLevelFromCategory} = require('./logging')); }
+          const m = payload.match(/^\[([a-z0-9_-]+)\]/i);
+            const cat = m ? m[1] : '';
+            lvl = deriveLevelFromCategory ? deriveLevelFromCategory(cat, payload) : 'INFO';
+        } catch(_) {}
+      }
+  // Always attempt timezone-aware timestamp directly
+  let ts;
+  try { const lg = require('./logging'); if (lg && typeof lg.tzTimestamp === 'function') { ts = lg.tzTimestamp(prefs); } } catch(_) {}
+  if (!ts) { try { ts = new Date().toISOString(); } catch(_) { ts = '1970-01-01T00:00:00.000Z'; } }
+  const stamped = ts + ' [' + lvl + '] ' + body;
+      try {
+        let mb = 2;
+        try { if (prefs && typeof prefs.logRotationMB === 'number') mb = prefs.logRotationMB; } catch(_) {}
+        if (!(mb > 0)) mb = 2;
+        if (mb > 64) mb = 64; // hard safety cap
+        const maxBytes = mb * 1024 * 1024;
+        let rotate = false;
+        try { const st = fs.statSync(logPath); if (st.size > maxBytes) rotate = true; } catch(_) {}
+        if (rotate) {
+          try {
+            const rotated = logPath + '.1';
+            try { fs.unlinkSync(rotated); } catch(_) {}
+            fs.renameSync(logPath, rotated);
+          } catch(_) {}
+        }
+      } catch(_) {}
+      fs.appendFileSync(logPath, stamped + '\n');
     }
   } catch(_) {}
   for (const w of BrowserWindow.getAllWindows()) {
@@ -654,14 +607,9 @@ function broadcast(channel, payload) {
   }
 }
 
-function captureCommandArgs() {
-  return [
-    '-m', 'capture.cli',
-    '--dir', path.join(projectRoot(), 'data'),
-    '--interval', String(prefs.interval || 5),
-    '--print-status', '--pid-file', PID_FILE
-  ];
-}
+// One-time retroactive level annotation for existing frontend.log entries without [INFO]/[ERROR]/etc.
+// levelizeExistingFrontendLog now provided by ./logging
+
 
 function autostartPaths() {
   if (process.platform === 'win32') {
@@ -698,14 +646,27 @@ function createLinuxAutostart(py, args) {
   const dataDir = path.join(pr, 'data');
   const wrapperPath = path.join(pr, 'hindsight_capture_wrapper.sh');
   const backendEnv = (prefs.backend && prefs.backend !== 'auto') ? `export HINDSIGHT_FORCE_BACKEND=${prefs.backend}\n` : '';
-  // Determine Electron launch command.
-  // In dev we assume running from repo with node_modules; attempt 'npx electron'.
-  const electronCmd = process.env.HINDSIGHT_ELECTRON_CMD || 'npx electron';
-  const script = `#!/usr/bin/env bash\nset -euo pipefail\nLOGDIR=\"${dataDir}\"\nmkdir -p \"$LOGDIR\"\nTS() { date -Iseconds; }\nlog() { echo \"$(TS) [wrapper] $*\" >> \"$LOGDIR/autostart.log\"; }\nlog start pid=$$ DISPLAY=$DISPLAY USER=$USER\n${effectiveDelay>0?`sleep ${effectiveDelay}\n`:''}cd \"${pr}\"\nexport HINDSIGHT_AUTOSTART=1\nlog launching electron interval=${prefs.interval||5} backend=${prefs.backend||'auto'} cmd='${electronCmd}'\n( ${electronCmd} frontend/main.js >> \"$LOGDIR/electron.autostart.out\" 2>&1 & echo $! > \"$LOGDIR/autostart.spawned.pid\" )\nSPAWNED=$(cat \"$LOGDIR/autostart.spawned.pid\")\nlog spawned electron_pid=$SPAWNED\n`;
+  // Determine Electron binary robustly; prefer local project electron dist, then node_modules/.bin, then global electron, then npx.
+  const localDist = path.join(projectRoot(), 'node_modules', 'electron', 'dist', 'electron');
+  const localBin = path.join(projectRoot(), 'node_modules', '.bin', 'electron');
+  let electronBin = '';
+  if (process.env.HINDSIGHT_ELECTRON_CMD) {
+    electronBin = process.env.HINDSIGHT_ELECTRON_CMD;
+  } else if (fs.existsSync(localDist)) {
+    electronBin = localDist;
+  } else if (fs.existsSync(localBin)) {
+    electronBin = localBin;
+  } else if (process.env.PATH && process.env.PATH.split(':').some(p=> fs.existsSync(path.join(p,'electron')))) {
+    electronBin = 'electron';
+  } else {
+    electronBin = 'npx electron';
+  }
+  const mainAbs = path.join(projectRoot(), 'frontend', 'main.js');
+  const script = `#!/usr/bin/env bash\nset -euo pipefail\nLOGDIR=\"${dataDir}\"\nmkdir -p \"$LOGDIR\"\nTS() { date -Iseconds; }\nlog() { echo \"$(TS) [wrapper] $*\" >> \"$LOGDIR/autostart.log\"; }\nlog start pid=$$ DISPLAY=$DISPLAY USER=$USER PATH=$PATH\n${effectiveDelay>0?`sleep ${effectiveDelay}\n`:''}cd \"${pr}\"\nexport HINDSIGHT_AUTOSTART=1\n# Resolve electron binary if placeholder chosen\nELECTRON_CMD='${electronBin}'\nif [[ $ELECTRON_CMD == 'npx electron' ]]; then\n  if ! command -v npx >/dev/null 2>&1; then log 'npx not found; cannot launch electron'; exit 1; fi\nfi\nlog launching electron cmd=\"$ELECTRON_CMD\" main=${mainAbs}\n( $ELECTRON_CMD \"${mainAbs}\" >> \"$LOGDIR/electron.autostart.out\" 2>&1 & echo $! > \"$LOGDIR/autostart.spawned.pid\" )\nSPAWNED=$(cat \"$LOGDIR/autostart.spawned.pid\")\nlog spawned electron_pid=$SPAWNED\n`;
   try {
     fs.writeFileSync(wrapperPath, script, {mode: 0o755});
   } catch (e) {
-    broadcast('log:line', `[error] failed writing wrapper script: ${e.message}`);
+  log('error', `failed writing wrapper script: ${e.message}`, 'ERROR');
   }
   const execLine = wrapperPath; // simpler & robust
   const chosenIcon = path.join(projectRoot(), 'frontend', 'hindsight_icon.png');
@@ -726,7 +687,12 @@ function enableAutostart(enable) {
   }
   fs.mkdirSync(path.dirname(p.file), {recursive: true});
   const py = getPythonCommand();
-  const args = captureCommandArgs();
+  const args = [
+    '-m','capture.cli',
+    '--dir', path.join(projectRoot(), 'data'),
+    '--interval', String(prefs.interval || 5),
+    '--print-status','--pid-file', PID_FILE
+  ];
   if (p.type === 'windows') {
     const content = `@echo off\ncd /d "${projectRoot()}"\n"${py}" ${args.map(a=>`"${a}"`).join(' ')}\n`;
     fs.writeFileSync(p.file, content, 'utf8');
@@ -738,7 +704,7 @@ function enableAutostart(enable) {
   }
   prefs.autostart = true;
   savePrefs(prefs);
-  broadcast('log:line', `[lifecycle] autostart enabled file=${p.file}`);
+  log('lifecycle', `autostart enabled file=${p.file}`);
   return true;
 }
 
@@ -805,11 +771,15 @@ ipcMain.handle('autostart:validate', () => validateAutostart());
 ipcMain.handle('prefs:get', () => ({...prefs}));
 ipcMain.handle('prefs:set', (_evt, newPrefs) => {
   const oldInterval = prefs.interval;
+  const oldLevel = prefs.logLevel;
   prefs = Object.assign(prefs, newPrefs || {});
+  if (!prefs.logLevel) prefs.logLevel = 'INFO';
+  if (typeof prefs.logRotationMB !== 'number' || !(prefs.logRotationMB > 0)) prefs.logRotationMB = 2;
+  if (prefs.logRotationMB > 64) prefs.logRotationMB = 64;
   savePrefs(prefs);
-  try { broadcast('log:line', `[prefs] updated interval=${prefs.interval} delay=${prefs.delaySeconds} tz=${prefs.logTimezone} dst=${prefs.dstAdjust}`); } catch(_) {}
+  try { log('prefs', `updated interval=${prefs.interval} delay=${prefs.delaySeconds} tz=${prefs.logTimezone} dst=${prefs.dstAdjust} level=${prefs.logLevel} rotMB=${prefs.logRotationMB}`); } catch(_) {}
   if (prefs.autostart) enableAutostart(true); // regenerate with new settings
-  if (prefs.interval !== oldInterval) {
+  if (prefs.interval !== oldInterval || prefs.logLevel !== oldLevel) {
     // Restart detached service by signaling stop then start.
     stopDetached();
     setTimeout(()=>startDetached(prefs.interval || 5), 500);
@@ -851,36 +821,30 @@ ipcMain.handle('data:purge', () => {
   wipeDir(plainDir);
   try { fs.unlinkSync(STATUS_FILE); removed++; } catch(_){}
   try { fs.unlinkSync(PID_FILE); removed++; } catch(_){}
-  broadcast('log:line', `[control] data purge removed ~${removed} items`);
+  log('control', `data purge removed ~${removed} items`);
   return {removed};
 });
 ipcMain.handle('auth:change', (_evt, payload) => {
   try {
     const {auth, next, useRecovery} = payload || {};
     if (!auth || !next) return {ok:false, err:'missing_fields'};
-    const py = getPythonCommand();
-    const args = [py, '-m','capture.keymgr','--base-dir', path.join(projectRoot(),'data'),'--change'];
+    const args = ['-m','capture.keymgr','--base-dir', path.join(projectRoot(),'data'),'--change'];
     if (useRecovery) args.push('--use-recovery');
-    const spawnSync = require('child_process').spawnSync;
-    const res = spawnSync(args[0], args.slice(1), {input: auth + '\n' + next + '\n', encoding:'utf8', cwd: projectRoot()});
+    const res = runPyHelper(args, {input: auth + '\n' + next + '\n'});
     if (res.status === 0) {
       let recovery = null;
       try { const parsed = JSON.parse(res.stdout||''); recovery = parsed.recovery || null; } catch(_) {}
-      if (recovery) {
-        try { promptForRecoveryModal(recovery); } catch(_) {}
-      }
+      if (recovery) { try { promptForRecoveryModal(recovery); } catch(_) {} }
       return {ok:true};
     }
     return {ok:false, code: res.status, err: (res.stderr||res.stdout||'').toString().trim()};
-  } catch (e) {
-    return {ok:false, err:String(e)};
-  }
+  } catch (e) { return {ok:false, err:String(e)}; }
 });
 
 // Manual debug logging IPC: emit arbitrary log lines from renderer
 ipcMain.handle('debug:log', (_evt, line) => {
   if (typeof line === 'string' && line.trim()) {
-    broadcast('log:line', `[debug] ${line.trim()}`);
+  log('debug', line.trim(), 'DEBUG');
     return {ok:true};
   }
   return {ok:false, error:'empty'};
@@ -895,13 +859,17 @@ function internalStopForHealth() {
 }
 
 function createWindow() {
-  if (_needPassGlobal && !unlockedUI) {
-    // UI still locked: require prompt before showing main window.
-    if (typeof _promptAndValidateBlocking === 'function') {
-      // Fire and rely on caller flow to show window after unlock.
+  if (_needPassGlobal) {
+    // UI requires authentication before showing main window; allow a one-shot suppression
+    if (!suppressNextUiPrompt && typeof _promptAndValidateBlocking === 'function') {
       _promptAndValidateBlocking();
+      return; // show after user completes prompt via subsequent action
     }
-    return; // defer actual window creation until unlocked
+    suppressNextUiPrompt = false; // reset after using suppression
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.show(); mainWindow.focus(); } catch(_) {}
+    return mainWindow;
   }
   const iconPath = resolveIconPath();
   const win = new BrowserWindow({
@@ -914,9 +882,15 @@ function createWindow() {
     },
     icon: iconPath || undefined,
   });
+  mainWindow = win;
+  try { log('lifecycle', 'main window created'); } catch(_) {}
+  win.on('ready-to-show', () => { try { log('lifecycle', 'main window ready-to-show'); } catch(_) {} });
+  win.on('show', () => { try { log('lifecycle', 'main window shown'); } catch(_) {} });
+  win.on('closed', () => { try { log('lifecycle', 'main window closed'); } catch(_) {}; mainWindow = null; });
   // Explicitly resolve index.html relative to this file's directory to avoid
   // Electron attempting to load it from the app root when main is outside.
   win.loadFile(path.join(__dirname, 'index.html'));
+  return win;
 }
 
 function ensureLinuxAppLauncher() {
@@ -935,280 +909,62 @@ function ensureLinuxAppLauncher() {
 }
 
 app.whenReady().then(() => {
+  // Global error hooks for diagnostics
+  process.on('uncaughtException', (err) => { try { log('error', `uncaughtException: ${err.stack||err.message}`, 'ERROR'); } catch(_) {} });
+  process.on('unhandledRejection', (reason) => { try { log('error', 'unhandledRejection: ' + (reason&&reason.stack||reason), 'ERROR'); } catch(_) {} });
   const autostartMode = process.env.HINDSIGHT_AUTOSTART === '1';
   // If an encrypted wrapped key exists, require passphrase before starting capture.
   const wrappedKeyPath = path.join(projectRoot(), 'data', 'encrypted', 'key.fernet.pass');
   const needPass = fs.existsSync(wrappedKeyPath) && !process.env.HINDSIGHT_PASSPHRASE;
   _needPassGlobal = needPass;
+  if (!authManager) {
+    authManager = new AuthManager({
+      broadcast,
+      projectRoot,
+      forceShowMainWindow,
+      startDetached: (i)=> startDetached(i,{userInitiated:true}),
+      readPid,
+      runPyHelper,
+      promptForPassphraseModal,
+      promptForRecoveryModal,
+      getPrefs: ()=> prefs,
+  log,
+    });
+    authManager.markNeedPass(needPass);
+  }
+  // Create tray immediately so user sees app presence even if unlock prompt will block later.
+  try { createTray(); } catch(e) { try { console.error('early tray failed', e); } catch(_) {} }
 
-  _promptAndValidateBlocking = async function promptAndValidateBlocking() {
-    // This opens a modal prompt and then validates using the python keymgr helper.
-    // Caller will not proceed until a valid passphrase is created or entered.
-    let lastLockLoggedSeconds = null; // remaining seconds when we last emitted [auth] currently locked until
-    while (true) {
-      // Check lock state before prompting
-      try {
-        const py = getPythonCommand();
-        const li = require('child_process').spawnSync(py, ['-m','capture.keymgr','--base-dir', path.join(projectRoot(),'data'),'--lock-info'], {encoding:'utf8', cwd: projectRoot()});
-        if (!li.error && li.status === 0 && li.stdout) {
-          try {
-            const info = JSON.parse(li.stdout);
-            // broadcast lock info to any open windows so modal can update
-            for (const w of BrowserWindow.getAllWindows()) try { w.webContents.send('auth:lock-update', info); } catch(_) {}
-            if (info.lock_until) {
-              const until = new Date(info.lock_until);
-              const now = new Date();
-              if (until > now) {
-                const secs = Math.ceil((until - now)/1000);
-                // Emit log only every 10s boundary, plus at 5s, and a 3,2,1 countdown.
-                const shouldLog = (
-                  secs === 5 || secs <= 3 || (secs % 10 === 0 && secs !== lastLockLoggedSeconds)
-                );
-                if (shouldLog) {
-                  broadcast('log:line', `[auth] currently locked until ${until.toISOString()} (${secs}s)`);
-                  lastLockLoggedSeconds = secs;
-                }
-                // Sleep a bit before re-checking to avoid tight looping
-                await new Promise(r => setTimeout(r, Math.min(10000, secs*1000)));
-                continue;
-              }
-            }
-          } catch (e) { /* ignore parse errors */ }
-        }
-      } catch (e) { /* ignore */ }
-  const creating = !needPass;
-  const pass = await promptForPassphraseModal(
-    needPass ? 'Enter passphrase / PIN to unlock' : 'Set a new passphrase or PIN',
-    {showComplexity: creating}
-  );
-      if (pass === null) {
-        // user cancelled; keep looping to enforce requirement
-        continue;
-      }
-      // Use python helper to create/validate via stdin. If wrapped key exists, validate; otherwise create.
-      try {
-        const py = getPythonCommand();
-        const args = [py, '-m', 'capture.keymgr'];
-        if (needPass) args.push('--validate'); else args.push('--create');
-        args.push('--base-dir', path.join(projectRoot(), 'data'), '--pass-stdin');
-        const spawnSync = require('child_process').spawnSync;
-        const res = spawnSync(args[0], args.slice(1), {input: pass + '\n', encoding: 'utf8', cwd: projectRoot()});
-        if (res.error) {
-          broadcast('log:line', `[auth] helper error: ${res.error.message}`);
-          continue;
-        }
-          if (res.status === 0) {
-            broadcast('log:line', '[auth] passphrase accepted');
-            // If this was a create operation, the helper printed a one-shot recovery token on stdout.
-            try {
-              if (!needPass) {
-                const token = (res.stdout || '').toString().trim();
-                if (token) {
-                  // show recovery modal and require user to save token before proceeding
-                  try { await promptForRecoveryModal(token); } catch (e) { /* ignore modal errors */ }
-                }
-              }
-            } catch (e) {}
-            // Start a short-lived IPC server that will hand the unwrapped key to the capture process.
-            try {
-              await startUnlockServer(pass);
-            } catch (e) {
-              broadcast('log:line', `[auth] failed starting unlock server: ${e.message}`);
-              continue;
-            }
-            // Check for autostart key presence (best-effort log)
-            try {
-              const py = getPythonCommand();
-              const spawnSync = require('child_process').spawnSync;
-              const out = spawnSync(py, ['-m','capture.keymgr','--base-dir', path.join(projectRoot(),'data'), '--get-autostart'], {encoding:'utf8', cwd: projectRoot()});
-              if (!out.error && out.status === 0 && out.stdout && out.stdout.trim()) {
-                broadcast('log:line', '[auth] autostart key present');
-              }
-            } catch (e) {}
-            const wasLocked = _needPassGlobal && !unlockedSuccessfully;
-            unlockedSuccessfully = true;
-            unlockedUI = true; // UI explicitly unlocked with passphrase
-            // If a deferred start was waiting on unlock, start now.
-            if (wasLocked && !readPid()) {
-              broadcast('log:line', '[lifecycle] starting capture now that key is unlocked');
-              startDetached(prefs.interval || 5);
-            }
-            return true;
-          }
-        // Non-zero status indicates invalid or complexity / usage failure.
-        const err = (res.stderr || res.stdout || '').toString();
-        // Status meanings from keymgr:
-        // 1 => invalid passphrase; 3 => complexity (create path) ValueError; 2 misuse; 4 fallback.
-        if (res.status === 3 || /complexity requirements/i.test(err)) {
-          broadcast('log:line', '[auth] passphrase does not meet complexity requirements (not counted as failure)');
-          // Loop again without recording a failed attempt.
-          continue;
-        }
-        broadcast('log:line', `[auth] validation failed: ${err.trim()}`);
-        if (res.status === 1) { // only count true invalid passphrase attempts toward lockout
-          try {
-            const py = getPythonCommand();
-            const rf = require('child_process').spawnSync(py, ['-m','capture.keymgr','--base-dir', path.join(projectRoot(),'data'), '--record-fail'], {encoding:'utf8', cwd: projectRoot()});
-            if (!rf.error && rf.status === 0 && rf.stdout) {
-              try {
-                const info = JSON.parse(rf.stdout);
-                for (const w of BrowserWindow.getAllWindows()) try { w.webContents.send('auth:lock-update', info); } catch(_) {}
-                if (info.lock_until) {
-                  broadcast('log:line', `[auth] locked until ${info.lock_until}`);
-                }
-              } catch (e) { /* ignore */ }
-            }
-          } catch (e) {}
-        }
-        // Loop again (the lock-info check at top will pause if needed)
-      } catch (e) {
-        broadcast('log:line', `[auth] exception validating passphrase: ${e.message}`);
-      }
-    }
-  };
+  _promptAndValidateBlocking = async () => { await authManager.promptAndValidateBlocking(); unlockedSuccessfully = authManager.isUnlocked(); _needPassGlobal = authManager.needsPass(); };
 
   (async () => {
     if (autostartMode) {
-      // Try autostart path: if keyring holds an autostart key, write ipc_info.json so capture can get it.
-      try {
-        const py = getPythonCommand();
-        const res = require('child_process').spawnSync(py, ['-m','capture.keymgr','--base-dir', path.join(projectRoot(),'data'), '--lock-info'], {encoding:'utf8', cwd: projectRoot()});
-        // We still need to create an unlock server for the capture to request the key.
-        // If keyring stored an autostart credential, write an ipc_info.json that the capture service can use to fetch key via a short-lived helper.
-        // Use keymgr helper (supports fallback keyring) instead of raw keyring import
-        const ka = require('child_process').spawnSync(py, ['-m','capture.keymgr','--base-dir', path.join(projectRoot(),'data'), '--get-autostart'], {encoding:'utf8', cwd: projectRoot()});
-        try {
-          broadcast('log:line', `[auth] autostart key probe status=${ka.status} err=${ka.error?ka.error.message:'none'} stdout_len=${(ka.stdout||'').trim().length}`);
-        } catch(_) {}
-        if (!ka.error && ka.status === 0 && ka.stdout && ka.stdout.trim()) {
-          // Autostart key is a base64-encoded raw data key, not the user passphrase.
-          const rawKey = ka.stdout.trim();
-          broadcast('log:line', '[auth] autostart raw key detected; starting unlock server (raw mode)');
-          try {
-            await startUnlockServer(rawKey, {raw: true});
-            // Mark unlocked (capture will fetch key shortly); if capture fails repeatedly we will still allow manual prompt on tray interaction.
-            unlockedSuccessfully = true; // capture may run
-            // Do NOT clear _needPassGlobal so tray/UI still prompt for passphrase; unlockedSuccessfully allows capture start.
-            // Intentionally leave unlockedUI = false so opening the UI will trigger the prompt path.
-            broadcast('log:line', '[auth] capture unlocked via autostart key (UI still locked)');
-          } catch (e) {
-            broadcast('log:line', `[auth] autostart raw key path failed (${e.message}); falling back to prompt`);
-            if (needPass || !fs.existsSync(path.join(projectRoot(), 'data', 'encrypted', 'key.fernet.pass'))) {
-              await _promptAndValidateBlocking();
-            }
-          }
-        } else {
-          // no autostart key available, fall back to prompt if needed
-          try { broadcast('log:line', '[auth] no autostart key present (will prompt if protection enabled)'); } catch(_) {}
-          if (needPass || !fs.existsSync(path.join(projectRoot(), 'data', 'encrypted', 'key.fernet.pass'))) {
-            await _promptAndValidateBlocking();
-          }
-        }
-      } catch (e) {
-        if (needPass || !fs.existsSync(path.join(projectRoot(), 'data', 'encrypted', 'key.fernet.pass'))) {
-          await _promptAndValidateBlocking();
-        }
-      }
+      await authManager.autostartAttempt(needPass);
+      unlockedSuccessfully = authManager.isUnlocked();
+      _needPassGlobal = authManager.needsPass();
     } else {
+      // Desktop launch: prompt BEFORE creating window so UI appears after auth
       if (needPass || !fs.existsSync(path.join(projectRoot(), 'data', 'encrypted', 'key.fernet.pass'))) {
         await _promptAndValidateBlocking();
+        // Prevent double-prompt when we immediately call createWindow next
+        suppressNextUiPrompt = true;
       }
     }
   if (!autostartMode) {
       createWindow();
     } else {
       // In autostart mode we stay in tray only until user clicks tray item.
-      broadcast('log:line', '[lifecycle] autostart tray-only mode (no initial window)');
+  log('lifecycle', 'autostart tray-only mode (no initial window)');
     }
-    createTray();
+  // Tray already created earlier; context menu will refresh periodically to reflect unlock state.
     if (!needPass || unlockedSuccessfully) {
       startDetached(prefs.interval || 5);
     } else {
-      broadcast('log:line', '[lifecycle] initial capture start deferred (waiting for unlock)');
+  log('lifecycle', 'initial capture start deferred (waiting for unlock)');
     }
   })();
 
-  // ---- Unlock server management ----
-  let _unlockServer = null;
-  async function startUnlockServer(secret, opts={}) {
-    // Create a TCP server on localhost and write ipc_info.json with port and token.
-    return new Promise((resolve, reject) => {
-      const crypto = require('crypto');
-      const net = require('net');
-      const token = crypto.randomBytes(24).toString('hex');
-      const server = net.createServer((sock) => {
-        let buf = '';
-        sock.setEncoding('utf8');
-        sock.on('data', (chunk) => {
-          buf += chunk;
-          if (buf.indexOf('\n') === -1) return;
-          let req;
-          try {
-            req = JSON.parse(buf);
-          } catch (e) {
-            sock.end(JSON.stringify({status: 'error', msg: 'bad_json'}) + '\n');
-            return;
-          }
-          if (req.token !== token || req.action !== 'get_key') {
-            sock.end(JSON.stringify({status: 'error', msg: 'invalid_token_or_action'}) + '\n');
-            return;
-          }
-          // Raw mode: secret is already base64 encoded data key.
-          if (opts.raw) {
-            sock.end(JSON.stringify({status: 'ok', key_b64: secret}) + '\n');
-            unlockedSuccessfully = true;
-            return; // keep server open for future restarts
-          }
-          // Passphrase mode: unwrap stored wrapped key using Python helper.
-          try {
-            const spawnSync = require('child_process').spawnSync;
-            const py = getPythonCommand();
-            const oneLiner = [
-              '-c',
-              // NOTE: Use \\n inside the rstrip argument so the Python code sees a literal backslash-n, avoiding an actual newline injection that broke the string previously.
-              'import sys, base64; from pathlib import Path; from capture.encryption import unwrap_key_with_passphrase; p = Path("data/encrypted/key.fernet.pass").read_bytes(); pw = sys.stdin.read().rstrip("\\n"); key = unwrap_key_with_passphrase(p, pw); sys.stdout.write(base64.b64encode(key).decode())'
-            ];
-            // Debug: log length of code to help diagnose future truncation issues (no passphrase logged)
-            try { broadcast('log:line', `[auth] spawning python unwrap helper len=${oneLiner[1].length}`); } catch(_) {}
-            const args = [py].concat(oneLiner);
-            const res = spawnSync(args[0], args.slice(1), {input: secret + '\n', encoding: 'utf8', cwd: projectRoot()});
-            if (res.status === 0) {
-              const out = (res.stdout || '').toString();
-              sock.end(JSON.stringify({status: 'ok', key_b64: out}) + '\n');
-              unlockedSuccessfully = true;
-            } else {
-              const reply = JSON.stringify({status: 'error', msg: (res.stderr || res.stdout || 'validation_failed').toString()}) + '\n';
-              sock.end(reply);
-            }
-          } catch (e) {
-            sock.end(JSON.stringify({status: 'error', msg: String(e)}) + '\n');
-          }
-        });
-        sock.on('error', () => {});
-      });
-      server.on('error', (err) => { reject(err); });
-      server.listen(0, '127.0.0.1', () => {
-        const address = server.address();
-        const port = address.port;
-        const ipcInfo = {host: '127.0.0.1', port, token};
-        const encDir = path.join(projectRoot(), 'data', 'encrypted');
-        const legacyPath = path.join(encDir, 'ipc_info.json'); // legacy filename (older builds)
-        const serviceExpected = path.join(encDir, 'key.fernet.ipc.json'); // service.py reads this
-        try {
-          fs.mkdirSync(encDir, {recursive:true});
-          fs.writeFileSync(serviceExpected, JSON.stringify(ipcInfo), {mode: 0o600});
-          // Also write legacy for backward compatibility / diagnostics
-          fs.writeFileSync(legacyPath, JSON.stringify(ipcInfo), {mode: 0o600});
-          broadcast('log:line', `[auth] wrote unlock IPC file ${serviceExpected}`);
-        } catch (e) {
-          server.close();
-          return reject(e);
-        }
-        _unlockServer = server;
-        resolve();
-      });
-    });
-  }
+  // (unlock server managed by AuthManager)
   ensureLinuxAppLauncher();
   // Periodic monitor: if we are unlocked but capture not running, attempt restart.
   setInterval(() => {
@@ -1235,9 +991,11 @@ app.whenReady().then(() => {
     powerMonitor.on('suspend', ()=> pauseCaptureForSystem('suspend'));
     powerMonitor.on('resume', ()=> resumeCaptureAfterSystem('suspend'));
     powerMonitor.on('shutdown', ()=> pauseCaptureForSystem('shutdown'));
-  } catch(e) { broadcast('log:line', `[error] powerMonitor setup failed: ${e.message}`); }
+  } catch(e) { log('error', `powerMonitor setup failed: ${e.message}`, 'ERROR'); }
   setupLinuxLockPolling();
-  broadcast('log:line', '[lifecycle] app ready, supervision initialized');
+  log('lifecycle', 'app ready, supervision initialized');
+  // Retroactively add levels to existing frontend.log lines once.
+  try { levelizeExistingFrontendLog(); } catch(_) {}
 });
 
 function promptForPassphraseModal(promptText, opts={}) {
@@ -1318,7 +1076,61 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   try {
-    broadcast('log:line', '[lifecycle] app quitting; stopping capture service');
+  log('lifecycle', 'app quitting; stopping capture service');
   } catch(_) {}
   try { stopDetached(); } catch(_) {}
+});
+
+// ---- Python log tail broadcasting (non-destructive; additive) ----
+let _pyLogTailActive = false;
+let _pyLogPos = {};
+function startPyLogTail() {
+  if (_pyLogTailActive) return; // already running
+  _pyLogTailActive = true;
+  const logDir = path.join(projectRoot(), 'data');
+  const files = ['capture.stdout.log', 'capture.stderr.log'];
+  for (const f of files) {
+    const full = path.join(logDir, f);
+    try {
+      if (!fs.existsSync(full)) fs.writeFileSync(full, '');
+      _pyLogPos[full] = fs.statSync(full).size; // start at end to avoid flooding with history
+    } catch(_) {}
+  }
+  function poll() {
+    for (const f of files) {
+      const full = path.join(logDir, f);
+      try {
+        const st = fs.statSync(full);
+        const prev = _pyLogPos[full] || 0;
+        if (st.size > prev) {
+          const fd = fs.openSync(full, 'r');
+          const len = st.size - prev;
+          const buf = Buffer.alloc(len);
+          fs.readSync(fd, buf, 0, len, prev);
+          fs.closeSync(fd);
+          _pyLogPos[full] = st.size;
+          const text = buf.toString('utf8');
+          const lines = text.split(/\r?\n/).filter(l => l.trim().length);
+          for (const line of lines) {
+            // Skip legacy verbose status prints if still present from prior runs
+            if (line.startsWith('STATUS::')) continue;
+            let level = 'INFO';
+            const m = line.match(/\] (DEBUG|INFO|WARNING|ERROR|CRITICAL) /);
+            if (m) level = m[1];
+            const payload = {file: f, level, line};
+            for (const w of BrowserWindow.getAllWindows()) {
+              try { w.webContents.send('pylog:line', payload); } catch(_) {}
+            }
+          }
+        }
+      } catch(_) {}
+    }
+    setTimeout(poll, 1300);
+  }
+  poll();
+}
+
+// Start tailer once app is ready and a window exists (gives renderer a listener)
+app.whenReady().then(() => {
+  try { startPyLogTail(); } catch(_) {}
 });

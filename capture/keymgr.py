@@ -99,8 +99,11 @@ def _kr_delete(base_dir: Path, name: str) -> None:
 
 
 def create_protection(base_dir: Path, passphrase: str) -> str:
-    if not _pass_complexity_ok(passphrase):
-        raise ValueError("Passphrase does not meet complexity requirements")
+    # Allow either a full complexity passphrase OR a 4–8 digit PIN at creation time.
+    # (Previously only complex passphrases were accepted, leading to user confusion when
+    # attempting to create with a PIN directly.)
+    if not (_pass_complexity_ok(passphrase) or _pin_ok(passphrase)):
+        raise ValueError("Passphrase/PIN does not meet complexity requirements")
     base_dir.mkdir(parents=True, exist_ok=True)
     enc_dir = _enc_dir_for(base_dir)
     enc_dir.mkdir(parents=True, exist_ok=True)

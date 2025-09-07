@@ -4,5 +4,7 @@
   "delaySeconds": 10,
   "backend": "mss",
   "logTimezone": "-0800",
-  "dstAdjust": true
+  "dstAdjust": true,
+  "logLevel": "WARNING",
+  "logRotationMB": 2
 }
