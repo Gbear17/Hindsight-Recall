@@ -14,11 +14,12 @@ let unlockedSuccessfully = false; // legacy mirror of authManager.isUnlocked()
 // Removed legacy unlockedUI flag: UI prompts every open.
 let suppressNextUiPrompt = false; // one-shot bypass after an immediate pre-prompt
 // Stronger guarantee that a main window is visible & focused shortly after unlock/open attempts.
-function forceShowMainWindow(retries=4) {
+function forceShowMainWindow(retries=4, skipPrompt=false) {
   try {
     let win = BrowserWindow.getAllWindows()[0];
     if (!win) {
-      suppressNextUiPrompt = true; // skip prompt in createWindow path
+  // Only suppress the auth prompt when caller explicitly requests it
+  if (skipPrompt) suppressNextUiPrompt = true; // skip prompt in createWindow path
       createWindow();
       win = BrowserWindow.getAllWindows()[0];
     }
@@ -32,7 +33,7 @@ function forceShowMainWindow(retries=4) {
     }
     if (retries > 0) {
       // In some DEs initial show can be overridden; retry a few times.
-      setTimeout(()=>forceShowMainWindow(retries-1), 180);
+  setTimeout(()=>forceShowMainWindow(retries-1, skipPrompt), 180);
     }
   } catch(_) {}
 }
@@ -140,14 +141,29 @@ function createTray() {
     const image = iconPath ? nativeImage.createFromPath(iconPath) : undefined;
     tray = new Tray(image || nativeImage.createEmpty());
     const ctx = Menu.buildFromTemplate([
-      {label: 'Show', click: ()=> { try { forceShowMainWindow(); } catch(_) {} }},
+      {label: 'Show', click: ()=> { try {
+          const wrappedKey = path.join(projectRoot(), 'data', 'encrypted', 'key.fernet.pass');
+          if (fs.existsSync(wrappedKey) && authManager && typeof authManager.needsPass === 'function' && authManager.needsPass()) {
+            if (typeof _promptAndValidateBlocking === 'function') { _promptAndValidateBlocking(); return; }
+          }
+          forceShowMainWindow();
+        } catch(_) {} }},
       {label: 'Start Capture', click: ()=> { try { startDetached(prefs.interval||5,{userInitiated:true}); } catch(_) {} }},
       {label: 'Stop Capture', click: ()=> { try { stopDetached(); } catch(_) {} }},
       {label: 'Quit', click: ()=> { try { app.quit(); } catch(_) {} }},
     ]);
     tray.setToolTip('Hindsight Recall');
     tray.setContextMenu(ctx);
-    tray.on('click', ()=> { try { forceShowMainWindow(); } catch(_) {} });
+    tray.on('click', ()=> {
+      try {
+        // If encrypted key exists and auth manager says we're locked, force the auth prompt.
+        const wrappedKey = path.join(projectRoot(), 'data', 'encrypted', 'key.fernet.pass');
+        if (fs.existsSync(wrappedKey) && authManager && typeof authManager.needsPass === 'function' && authManager.needsPass() && typeof authManager.isUnlocked === 'function' && !authManager.isUnlocked()) {
+          if (typeof _promptAndValidateBlocking === 'function') { _promptAndValidateBlocking(); return; }
+        }
+        forceShowMainWindow();
+      } catch(_) {}
+    });
     return tray;
   } catch(e) {
     try { console.error('tray create failed', e); } catch(_) {}
@@ -935,7 +951,15 @@ app.whenReady().then(() => {
   // Create tray immediately so user sees app presence even if unlock prompt will block later.
   try { createTray(); } catch(e) { try { console.error('early tray failed', e); } catch(_) {} }
 
-  _promptAndValidateBlocking = async () => { await authManager.promptAndValidateBlocking(); unlockedSuccessfully = authManager.isUnlocked(); _needPassGlobal = authManager.needsPass(); };
+  _promptAndValidateBlocking = async () => {
+    await authManager.promptAndValidateBlocking();
+    unlockedSuccessfully = authManager.isUnlocked();
+    _needPassGlobal = authManager.needsPass();
+    // If caller invoked the prompt (e.g. via tray) without awaiting, ensure we
+    // suppress the immediate re-prompt and show the UI once authentication completed.
+    try { suppressNextUiPrompt = true; } catch(_) {}
+    try { forceShowMainWindow(/*retries=*/4, /*skipPrompt=*/true); } catch(_) {}
+  };
 
   (async () => {
     if (autostartMode) {

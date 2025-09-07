@@ -4,14 +4,21 @@
   <meta charset="UTF-8">
   <title>Hindsight Recall</title>
   <style>
-    /* Log level highlighting */
-    .log-line { white-space: pre; font-family: monospace; }
-    .log-level-DEBUG { color:#888; }
-    .log-level-INFO { color:#eee; }
-    .log-level-WARNING { color:#ffd866; }
-    .log-level-ERROR { color:#ff6b6b; }
-    .log-level-CRITICAL { color:#ff3dff; font-weight:bold; }
-    #pyLogView { font-family: monospace; }
+  /* Log level highlighting */
+  .log-line { white-space: pre; font-family: monospace; display:block; padding:2px 6px; margin:0; }
+  /* Low-priority / trace */
+  .log-level-TRACE { color:#9aa; }
+  /* Debug is muted gray */
+  .log-level-DEBUG { color:#9a9a9a; }
+  /* Normal informational */
+  .log-level-INFO { color:#dcdcdc; }
+  /* Warnings stand out in orange with subtle background */
+  .log-level-WARNING { color:#ffb84d; background: rgba(255,184,77,0.04); }
+  /* Errors in red */
+  .log-level-ERROR { color:#ff6b6b; background: rgba(255,107,107,0.04); font-weight:600; }
+  /* Critical/high severity: bold and stronger red, left accent */
+  .log-level-CRITICAL, .log-level-CRIT { color:#ff3d3d; background: rgba(255,61,61,0.06); font-weight:700; border-left:4px solid rgba(255,61,61,0.12); padding-left:6px; }
+  #pyLogView { font-family: monospace; }
   .collapseBtn { cursor:pointer; border:1px solid #888; background:#eee; color:#222; font-size:10px; width:18px; height:18px; line-height:16px; padding:0; text-align:center; border-radius:3px; }
   .prefHeader { display:flex; align-items:center; gap:6px; margin:0 0 6px 0; }
   .collapsibleHeader { display:flex; align-items:flex-end; gap:8px; flex-wrap:wrap; }
@@ -77,16 +84,18 @@
   </div>
     <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:4px 0 8px 0;">
       <div style="font-size:12px;">Levels:
-        <label style="margin-left:6px;font-weight:normal;"><input type="checkbox" class="lvChk" data-level="DEBUG" checked /> DEBUG</label>
-        <label style="margin-left:6px;font-weight:normal;"><input type="checkbox" class="lvChk" data-level="INFO" checked /> INFO</label>
-        <label style="margin-left:6px;font-weight:normal;"><input type="checkbox" class="lvChk" data-level="WARNING" checked /> WARN</label>
-        <label style="margin-left:6px;font-weight:normal;"><input type="checkbox" class="lvChk" data-level="ERROR" checked /> ERROR</label>
-        <label style="margin-left:6px;font-weight:normal;"><input type="checkbox" class="lvChk" data-level="CRITICAL" checked /> CRIT</label>
+  <label style="margin-left:6px;font-weight:normal;"><input type="checkbox" class="lvChk" data-level="TRACE" checked /> TRACE</label>
+  <label style="margin-left:6px;font-weight:normal;"><input type="checkbox" class="lvChk" data-level="DEBUG" checked /> DEBUG</label>
+  <label style="margin-left:6px;font-weight:normal;"><input type="checkbox" class="lvChk" data-level="INFO" checked /> INFO</label>
+  <label style="margin-left:6px;font-weight:normal;"><input type="checkbox" class="lvChk" data-level="WARNING" checked /> WARN</label>
+  <label style="margin-left:6px;font-weight:normal;"><input type="checkbox" class="lvChk" data-level="ERROR" checked /> ERROR</label>
+  <label style="margin-left:6px;font-weight:normal;"><input type="checkbox" class="lvChk" data-level="CRITICAL" checked /> CRIT</label>
       </div>
       <button id="pyLogClear" style="font-size:12px;">Clear</button>
+  <button id="simLog" style="font-size:12px;">Simulate Logs</button>
       <span id="pyLogStats" style="font-size:11px;color:#555;"></span>
     </div>
-    <pre id="pyLogView" style="background:#000;color:#eee;padding:8px;max-height:480px;overflow:auto;font-size:12px;line-height:1.3;border:1px solid #333;"></pre>
+  <div id="pyLogView" style="background:#000;color:#eee;padding:8px;max-height:480px;overflow:auto;font-size:12px;line-height:1.3;border:1px solid #333;"></div>
   </div>
   <div id="pagePrefs" style="display:none;max-width:640px;">
     <h2 style="margin-top:0;">Preferences <button id="closePrefs" style="float:right;font-size:12px;">Close</button></h2>
@@ -440,10 +449,10 @@
         const clearBtn = document.getElementById('pyLogClear');
         const BUF_MAX = 500; const buf = []; // {level,line,src}
         function enabled(){ const m={}; document.querySelectorAll('.lvChk').forEach(cb=>{ m[cb.getAttribute('data-level')] = cb.checked; }); return m; }
-  function updateStats(){ const c={DEBUG:0,INFO:0,WARNING:0,ERROR:0,CRITICAL:0}; for (const b of buf) c[b.level] = (c[b.level]||0)+1; stats.textContent = `Buffered ${buf.length}/${BUF_MAX}  D:${c.DEBUG} I:${c.INFO} W:${c.WARNING} E:${c.ERROR} C:${c.CRITICAL}`; }
+  function updateStats(){ const c={TRACE:0,DEBUG:0,INFO:0,WARNING:0,ERROR:0,CRITICAL:0}; for (const b of buf) c[b.level] = (c[b.level]||0)+1; stats.textContent = `Buffered ${buf.length}/${BUF_MAX}  T:${c.TRACE} D:${c.DEBUG} I:${c.INFO} W:${c.WARNING} E:${c.ERROR} C:${c.CRITICAL}`; }
   function esc(s){ return s.replace(/[&<>"']/g, c=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c])); }
   function renderLine(entry){ return `<span class="log-line log-level-${entry.level}">${esc(entry.line)}</span>`; }
-  function rebuild(){ const en=enabled(); const stick=(view.scrollTop+view.clientHeight+40)>=view.scrollHeight; const html = buf.filter(b=>en[b.level]).map(renderLine).join('\n'); view.innerHTML = html; if (stick) view.scrollTop=view.scrollHeight; updateStats(); }
+  function rebuild(){ const en=enabled(); const stick=(view.scrollTop+view.clientHeight+40)>=view.scrollHeight; const html = buf.filter(b=>en[b.level]).map(renderLine).join(''); view.innerHTML = html; if (stick) view.scrollTop=view.scrollHeight; updateStats(); }
         // Backend timezone spec aware timestamp (mirrors main.js tz logic subset)
         let _logTzSpec = 'LOCAL';
         let _dstAdjust = false;
@@ -496,12 +505,26 @@
     if(en[lvl]) {
       const stick=(view.scrollTop+view.clientHeight+40)>=view.scrollHeight;
       const spanHtml = `<span class="log-line log-level-${lvl}">${esc(stamped)}</span>`;
-      view.innerHTML += (view.innerHTML?'\n':'')+spanHtml;
+      // Append without adding literal newlines; spans are block-level and handle line breaks.
+      view.innerHTML += spanHtml;
       if(stick) view.scrollTop=view.scrollHeight;
     }
     updateStats();
   }
         clearBtn.addEventListener('click', ()=>{ buf.length=0; rebuild(); });
+        const simBtn = document.getElementById('simLog');
+        if (simBtn) {
+          simBtn.addEventListener('click', ()=>{
+            // Emit one sample entry for each level for visual testing
+            ingest('Simulated TRACE message for testing colors', 'TRACE', 'sim');
+            ingest('Simulated DEBUG message for testing colors', 'DEBUG', 'sim');
+            ingest('Simulated INFO message for testing colors', 'INFO', 'sim');
+            ingest('Simulated WARNING message for testing colors', 'WARNING', 'sim');
+            ingest('Simulated ERROR message for testing colors', 'ERROR', 'sim');
+            ingest('Simulated CRITICAL message for testing colors', 'CRITICAL', 'sim');
+            updateStats();
+          });
+        }
         document.querySelectorAll('.lvChk').forEach(cb=> cb.addEventListener('change', rebuild));
         // Python backend log lines
         window.hindsight.onPyLog(pl=>{ if(!pl||!pl.line) return; ingest(pl.line, pl.level||'INFO', 'py'); });
@@ -528,6 +551,7 @@
               case 'duplicate':
               case 'heartbeat':
               case 'tz': level = 'DEBUG'; break;
+              case 'trace': level = 'TRACE'; break;
               case 'auth': level = /failed|locked/i.test(line) ? 'WARNING' : 'INFO'; break;
               default: level = 'INFO';
             }

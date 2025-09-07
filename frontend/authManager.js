@@ -118,7 +118,7 @@ class AuthManager {
   if (res.error) { this.log('auth', `helper error: ${res.error.message}`); continue; }
         if (res.status === 0) {
           this.log('auth', 'passphrase accepted');
-          try { this.forceShowMainWindow(); } catch {}
+          try { this.forceShowMainWindow( /* skipPrompt= */ true); } catch {}
           if (!keyExists) {
             const token = (res.stdout||'').toString().trim();
             if (token) { try { await this.promptForRecoveryModal(token); } catch {} }
