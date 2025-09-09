@@ -26,4 +26,5 @@ contextBridge.exposeInMainWorld('hindsight', {
   purgeData: () => ipcRenderer.invoke('data:purge'),
   changeSecret: (auth, next, useRecovery=false) => ipcRenderer.invoke('auth:change', {auth, next, useRecovery}),
   debugLog: (line) => ipcRenderer.invoke('debug:log', line)
+  , logsRecent: () => ipcRenderer.invoke('logs:recent')
 });

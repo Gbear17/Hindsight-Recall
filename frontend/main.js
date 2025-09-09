@@ -204,6 +204,34 @@ let lastBroadcastSequence = -1;
 let lastBroadcastCaptureCount = -1;
 let lastBroadcastError = null;
 let lastBroadcastInstance = null;
+let _statusHash = null; // hash of last written status content for dedupe
+// Duplicate frame logging aggregation state to reduce noise
+let duplicateStreak = 0;
+let duplicateWindow = null;
+let lastDuplicateLogTs = 0;
+const DUP_LOG_INTERVAL_MS = 15000; // summarize at most every 15s
+const DUP_LOG_MIN_BATCH = 3; // minimum duplicates before summary
+
+function stableHash(str) {
+  // Simple FNV-1a 32-bit hash for small JSON strings
+  try {
+    let h = 0x811c9dc5;
+    for (let i=0;i<str.length;i++) { h ^= str.charCodeAt(i); h = (h >>> 0) * 0x01000193; }
+    return (h >>> 0).toString(16);
+  } catch { return null; }
+}
+
+function writeStatusAtomic(obj) {
+  try {
+    const json = JSON.stringify(obj);
+    const h = stableHash(json);
+    if (h && _statusHash === h) return; // unchanged, skip write
+    const tmp = STATUS_FILE + '.tmp';
+    fs.writeFileSync(tmp, json);
+    fs.renameSync(tmp, STATUS_FILE);
+    _statusHash = h;
+  } catch(_) {}
+}
 
 function pauseCaptureForSystem(kind) {
   if (systemPaused) return;
@@ -488,8 +516,36 @@ function pollStatus() {
           log('anomaly', `capture_count regressed from ${lastLoggedCaptureCount} to ${data.capture_count}; possible stale secondary process`);
         }
         lastLoggedCaptureCount = data.capture_count;
+        // Flush duplicate streak summary when a real capture occurs
+        if (duplicateStreak >= DUP_LOG_MIN_BATCH) {
+          log('duplicate', `skipped ${duplicateStreak} identical frame(s) window="${duplicateWindow}"`);
+        } else if (duplicateStreak > 0) {
+          // Still log small streaks for visibility but grouped
+          log('duplicate', `skipped ${duplicateStreak} identical frame(s) window="${duplicateWindow}"`);
+        }
+        duplicateStreak = 0;
+        duplicateWindow = null;
       } else if (data.duplicate === true) {
-        log('duplicate', `skipped frame (same as previous) window="${data.window_title}"`);
+        // Aggregate duplicate notifications to prevent per-interval spam.
+        if (duplicateWindow && data.window_title !== duplicateWindow) {
+          // Window changed mid-streak; flush existing streak first
+            if (duplicateStreak >= DUP_LOG_MIN_BATCH) {
+              log('duplicate', `skipped ${duplicateStreak} identical frame(s) window="${duplicateWindow}"`);
+            } else if (duplicateStreak > 0) {
+              log('duplicate', `skipped ${duplicateStreak} identical frame(s) window="${duplicateWindow}"`);
+            }
+            duplicateStreak = 0;
+        }
+        duplicateWindow = data.window_title;
+        duplicateStreak += 1;
+        const now = Date.now();
+        if (duplicateStreak === 1) {
+          log('duplicate', `started duplicate streak window="${data.window_title}"`);
+          lastDuplicateLogTs = now;
+        } else if (now - lastDuplicateLogTs >= DUP_LOG_INTERVAL_MS) {
+          log('duplicate', `continuing duplicate streak (${duplicateStreak} frames) window="${data.window_title}"`);
+          lastDuplicateLogTs = now;
+        }
       }
       if (typeof data.sequence === 'number' && data.sequence > lastSequence) {
         lastSequence = data.sequence;
@@ -573,51 +629,7 @@ let log = function(category, message, levelOverride) {
   }
 };
 function broadcast(channel, payload) {
-  // Also append log lines to a rolling file for diagnostics (timezone-aware local timestamp with offset).
-  try {
-    if (channel === 'log:line') {
-      const logPath = path.join(projectRoot(), 'data', 'frontend.log');
-      try { fs.mkdirSync(path.dirname(logPath), {recursive:true}); } catch(_) {}
-  try { if (Math.random() < 0.01) console.log('[diag] broadcast log payload:', payload.slice(0,120)); } catch(_) {}
-      // Unified log() now always supplies a leading [LEVEL]; if absent, attempt lightweight derivation.
-  const levelTokenRegex = /^\[(DEBUG|INFO|WARNING|ERROR|CRITICAL|TRACE)\]/i;
-      let lvl = 'INFO';
-      let body = payload;
-      if (levelTokenRegex.test(payload)) {
-        lvl = payload.match(levelTokenRegex)[1].toUpperCase();
-        body = payload.replace(levelTokenRegex, '').trimStart();
-      } else {
-        try {
-          if (!deriveLevelFromCategory) { ({deriveLevelFromCategory} = require('./logging')); }
-          const m = payload.match(/^\[([a-z0-9_-]+)\]/i);
-            const cat = m ? m[1] : '';
-            lvl = deriveLevelFromCategory ? deriveLevelFromCategory(cat, payload) : 'INFO';
-        } catch(_) {}
-      }
-  // Always attempt timezone-aware timestamp directly
-  let ts;
-  try { const lg = require('./logging'); if (lg && typeof lg.tzTimestamp === 'function') { ts = lg.tzTimestamp(prefs); } } catch(_) {}
-  if (!ts) { try { ts = new Date().toISOString(); } catch(_) { ts = '1970-01-01T00:00:00.000Z'; } }
-  const stamped = ts + ' [' + lvl + '] ' + body;
-      try {
-        let mb = 2;
-        try { if (prefs && typeof prefs.logRotationMB === 'number') mb = prefs.logRotationMB; } catch(_) {}
-        if (!(mb > 0)) mb = 2;
-        if (mb > 64) mb = 64; // hard safety cap
-        const maxBytes = mb * 1024 * 1024;
-        let rotate = false;
-        try { const st = fs.statSync(logPath); if (st.size > maxBytes) rotate = true; } catch(_) {}
-        if (rotate) {
-          try {
-            const rotated = logPath + '.1';
-            try { fs.unlinkSync(rotated); } catch(_) {}
-            fs.renameSync(logPath, rotated);
-          } catch(_) {}
-        }
-      } catch(_) {}
-      fs.appendFileSync(logPath, stamped + '\n');
-    }
-  } catch(_) {}
+  // File writing & rotation handled centrally in logging.js singleton; here we only forward to renderer.
   for (const w of BrowserWindow.getAllWindows()) {
     try { w.webContents.send(channel, payload); } catch (_) {}
   }
@@ -801,6 +813,24 @@ ipcMain.handle('prefs:set', (_evt, newPrefs) => {
     setTimeout(()=>startDetached(prefs.interval || 5), 500);
   }
   return {...prefs};
+});
+// IPC: runtime python log level change (best-effort via control file read by future processes)
+ipcMain.handle('loglevel:set', (_evt, lvl) => {
+  try {
+    if (typeof lvl === 'string' && lvl.trim()) {
+      prefs.logLevel = lvl.trim().toUpperCase();
+      savePrefs(prefs);
+      // For already running capture process we cannot safely inject level without a custom IPC; future restarts will apply.
+      log('control', `python log level updated (takes effect next restart) level=${prefs.logLevel}`);
+      return {ok:true, level:prefs.logLevel};
+    }
+  } catch(e) { return {ok:false, error:String(e)}; }
+  return {ok:false, error:'invalid'};
+});
+ipcMain.handle('loglevel:get', () => ({level: (prefs.logLevel||'INFO').toUpperCase()}));
+ipcMain.handle('logs:recent', () => {
+  try { const lg = require('./logging'); if (lg && typeof lg.getRecentLines === 'function') return {lines: lg.getRecentLines()}; } catch(_) {}
+  return {lines: []};
 });
 // Auth handler: accept passphrase from renderer and stash into env for child processes.
 ipcMain.handle('auth:submit', (_evt, passphrase) => {

@@ -282,7 +282,22 @@
         if (!document.getElementById('openLogs')) {
           const btn = document.createElement('button'); btn.id='openLogs'; btn.textContent='Logs'; btn.style.float='right'; btn.style.fontSize='12px'; btn.style.marginLeft='6px';
           const h1 = document.querySelector('h1'); if (h1) { h1.appendChild(btn); }
-          btn.addEventListener('click', ()=>{ pageMain.style.display='none'; pagePrefs.style.display='none'; document.getElementById('pageLogs').style.display='block'; });
+          btn.addEventListener('click', ()=>{ 
+            pageMain.style.display='none'; pagePrefs.style.display='none'; document.getElementById('pageLogs').style.display='block';
+            try {
+              window.hindsight.logsRecent().then(r=>{
+                if(!r||!r.lines) return; const view=document.getElementById('pyLogView'); if(!view) return;
+                // Only append if viewer currently near-empty to avoid duplicating lines
+                if(view.children.length < 5) {
+                  const en={}; document.querySelectorAll('.lvChk').forEach(cb=> en[cb.getAttribute('data-level')] = cb.checked);
+                  const mkSpan=(lvl,ln)=>`<span class="log-line log-level-${lvl}">${ln.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]))}</span>`;
+                  const html = r.lines.map(ln=>{ const m=ln.match(/^\[(DEBUG|INFO|WARNING|ERROR|CRITICAL|TRACE)\]\s+/i); const lvl=m?m[1].toUpperCase():'INFO'; return en[lvl]?mkSpan(lvl,ln):''; }).join('');
+                  view.innerHTML += html;
+                  view.scrollTop = view.scrollHeight;
+                }
+              }).catch(()=>{});
+            } catch(_) {}
+          });
         }
       })();
       document.getElementById('closeLogs').addEventListener('click', ()=>{ document.getElementById('pageLogs').style.display='none'; pageMain.style.display='block'; });

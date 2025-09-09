@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import base64
 import json
 import os
@@ -14,6 +15,11 @@ import keyring
 from cryptography.fernet import Fernet
 
 from .encryption import generate_key, wrap_key_with_passphrase, unwrap_key_with_passphrase
+try:  # centralized logging (idempotent)
+    from .logging_config import configure_logging
+    configure_logging(level=os.environ.get('HINDSIGHT_LOG_LEVEL','INFO'))
+except Exception:
+    logging.basicConfig(level=os.environ.get('HINDSIGHT_LOG_LEVEL','INFO'), format='[%(asctime)s] %(levelname)s %(name)s: %(message)s')
 
 SERVICE_NAME = "hindsight_recall"
 CHALLENGE_ENTRY = "challenge"

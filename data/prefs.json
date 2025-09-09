@@ -5,6 +5,6 @@
   "backend": "mss",
   "logTimezone": "-0800",
   "dstAdjust": true,
-  "logLevel": "WARNING",
+  "logLevel": "DEBUG",
   "logRotationMB": 2
 }

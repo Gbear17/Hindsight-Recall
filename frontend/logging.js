@@ -1,5 +1,9 @@
 // Centralized logging utilities for the Electron main process
-// Provides: tzTimestamp, deriveLevelFromCategory, levelizeExistingFrontendLog, appendFrontendLog
+// Enhancements (2025-09-07):
+//  * Added singleton logger with rotation & threshold filtering.
+//  * Added setLevel/getLevel helpers (idempotent init support).
+//  * Moved rotation logic here (was previously in main.js broadcast path).
+//  * All file writes now stamped with timezone-aware timestamp atomically+rotated.
 
 const fs = require('fs');
 const path = require('path');
@@ -83,22 +87,65 @@ function levelizeExistingFrontendLog() {
   } catch (_) {}
 }
 
-function appendFrontendLog(line) {
+function appendFrontendLog(line) { // retained for backward compatibility (unused after centralization)
   try { fs.appendFileSync(frontendLogPath(), line + '\n'); } catch(_) {}
 }
 
+// ---- Singleton Logger Implementation ----
+let _singletonLogger = null;
+const LEVEL_ORDER = ['TRACE','DEBUG','INFO','WARNING','ERROR','CRITICAL'];
+function levelIndex(l) { const u = String(l||'INFO').toUpperCase(); const i = LEVEL_ORDER.indexOf(u); return i === -1 ? 2 : i; }
+const _recent = [];
+const _RECENT_MAX = 500;
+
+function rotateIfNeeded(logPath, prefs) {
+  let mb = 2;
+  try { if (prefs && typeof prefs.logRotationMB === 'number' && prefs.logRotationMB > 0) mb = prefs.logRotationMB; } catch(_) {}
+  if (mb > 64) mb = 64; // safety cap
+  const maxBytes = mb * 1024 * 1024;
+  try {
+    const st = fs.statSync(logPath);
+    if (st.size > maxBytes) {
+      const rotated = logPath + '.1';
+      try { fs.unlinkSync(rotated); } catch(_) {}
+      try { fs.renameSync(logPath, rotated); } catch(_) {}
+    }
+  } catch(_) {}
+}
+
 function makeLogger(opts) {
-  const {broadcast, getPrefs} = opts;
-  return function log(category, message, levelOverride) {
+  // Idempotent: return existing instance if already created.
+  if (_singletonLogger) return _singletonLogger;
+  const {broadcast, getPrefs} = opts || {};
+  function writeStamped(line, prefs) {
+    try { fs.mkdirSync(path.dirname(frontendLogPath()), {recursive:true}); } catch(_) {}
+    rotateIfNeeded(frontendLogPath(), prefs);
+    // Atomic-ish append (line writes are effectively atomic on POSIX for small lines).
+    fs.appendFileSync(frontendLogPath(), line + '\n');
+  }
+  function logger(category, message, levelOverride) {
     const prefs = typeof getPrefs === 'function' ? getPrefs() : null;
-    const msg = (message==null?'':String(message)).trim();
-    const level = (levelOverride || deriveLevelFromCategory(category||'', msg) || 'INFO').toUpperCase();
-    // Compose line with explicit level and category for downstream filtering
-    const line = `[${level}] [${category||'misc'}] ${msg}`;
-    try { broadcast('log:line', line); } catch(_) {}
-    // Optionally could append here, but broadcast path already handles file write.
-    return line;
+    const rawMsg = (message == null ? '' : String(message)).trim();
+    const derivedLevel = (levelOverride || deriveLevelFromCategory(category||'', rawMsg) || 'INFO').toUpperCase();
+    const threshold = (prefs && prefs.logLevel ? String(prefs.logLevel) : 'INFO').toUpperCase();
+    if (levelIndex(derivedLevel) < levelIndex(threshold)) return null; // below threshold
+    let ts;
+    try { ts = tzTimestamp(prefs); } catch(_) { try { ts = new Date().toISOString(); } catch(_) { ts = '1970-01-01T00:00:00.000Z'; } }
+    const lineNoTs = `[${derivedLevel}] [${category||'misc'}] ${rawMsg}`;
+    const stamped = ts + ' ' + lineNoTs;
+    try { writeStamped(stamped, prefs); } catch(_) {}
+    try { if (typeof broadcast === 'function') broadcast('log:line', lineNoTs); } catch(_) {}
+    try {
+      _recent.push(lineNoTs); if (_recent.length > _RECENT_MAX) _recent.splice(0, _recent.length - _RECENT_MAX);
+    } catch(_) {}
+    return lineNoTs;
+  }
+  logger.setLevel = (lvl) => {
+    if (!lvl) return; try { const p = getPrefs && getPrefs(); if (p) p.logLevel = String(lvl).toUpperCase(); } catch(_) {}
   };
+  logger.getLevel = () => { try { const p = getPrefs && getPrefs(); return (p && p.logLevel) ? String(p.logLevel).toUpperCase() : 'INFO'; } catch(_) { return 'INFO'; } };
+  _singletonLogger = logger;
+  return _singletonLogger;
 }
 
 module.exports = {
@@ -106,5 +153,6 @@ module.exports = {
   deriveLevelFromCategory,
   levelizeExistingFrontendLog,
   appendFrontendLog,
-  makeLogger,
+  makeLogger, // now returns a singleton
+  getRecentLines: () => _recent.slice(),
 };

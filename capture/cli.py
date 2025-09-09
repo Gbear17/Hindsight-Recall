@@ -34,7 +34,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    logging.basicConfig(level=args.log_level.upper(), format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
+    # Centralized logging configuration
+    try:
+        from .logging_config import configure_logging
+        configure_logging(level=args.log_level.upper(), json_mode=False)
+    except Exception:
+        logging.basicConfig(level=args.log_level.upper(), format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     base_dir = Path(args.base_dir)
 
     # --- Single instance enforcement ---
