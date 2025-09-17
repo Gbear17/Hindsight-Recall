@@ -1,5 +1,5 @@
 {
-  "autostart": true,
+  "autostart": false,
   "interval": 5,
   "delaySeconds": 10,
   "backend": "mss",
